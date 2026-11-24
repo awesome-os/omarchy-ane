@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+# omarchy-ane-check: report whether the Apple Neural Engine driver is ready.
+#
+#   omarchy-ane-check              check the running kernel: the SoC, where
+#                                  m1n1's device trees come from (dtbs_source),
+#                                  whose driver it runs (driver_source), the ANE
+#                                  device-tree node, the driver built, loaded,
+#                                  bound, and the /dev/accel node. On T602x the
+#                                  driver is ane_t6021, and it also checks the
+#                                  firmware the kernel loads: the Asahi vendor
+#                                  firmware copy, else the one that
+#                                  omarchy-ane-firmware-fetch installs.
+#   omarchy-ane-check --installed  check that ane.ko and ane_t6021.ko exist
+#                                  for every installed kernel with headers
+#                                  (pacman hook)
+#   omarchy-ane-check --smoke      the same checks, then, when all pass, run
+#                                  omarchy-ane-smoke (the shipped add program,
+#                                  20 calls through libane) and print its
+#                                  result line. An unavailable smoke is a
+#                                  note, not a failure.
+#
+# --root DIR (first argument) reads the system below DIR (tests).
+# Read-only. It never loads, unloads, or binds the module.
+# Exit 0 when every check passes, 1 when a check fails, 2 on bad usage.
+set -u
+shopt -s nullglob
+
+# The community collector's vocabulary (omarchy-mlx scripts/collect_deep.py):
+# it records driver_source and dtbs_source, and tools/promotion_check.py judges
+# driver_source. omarchy-ane-dt status owns the dtbs_source line and statement.
+DRIVER_SOURCE=driver_source
+INTREE_KERNEL="userspace + smoke + firmware fetch only; do not install omarchy-ane-dkms"
+
+root=""
+[[ ${1:-} == --root ]] && { root=${2:?--root needs a directory}; shift 2; }
+
+fail=0
+ok()  { printf '  ok    %s\n' "$*"; }
+bad() { printf '  FAIL  %s\n' "$*"; fail=1; }
+finish() {
+  if (( fail )); then echo "omarchy-ane-check: FAILED"; exit 1; fi
+  echo "omarchy-ane-check: ready"; exit 0
+}
+
+# built KERNEL MODULE
+built() {
+  local file
+  file=$(modfile filename "$1" "$2")
+  if [[ -n $file ]]; then
+    ok "$2.ko built for $1: $file (version $(modfile version "$1" "$2"))"
+  else
+    bad "$2.ko is not built for kernel $1. Install the headers for $1, then run: sudo dkms autoinstall -k $1"
+  fi
+}
+
+tool() {
+  local path
+  path=$(dirname -- "$(realpath -- "$0")")/$1
+  [[ -x $path ]] || path=$(command -v "$1" || true)
+  printf '%s\n' "$path"
+}
+
+# modinfo FIELD KERNEL MODULE. Without --root (the running system) no -b is
+# passed, so kmod honors MODULE_DIR (NixOS points it at the booted kernel's
+# tree, /run/booted-system/kernel-modules); a plain lookup without -k follows,
+# which resolves the loaded module itself. With --root (tests) the -b lookup
+# below DIR/usr/lib/modules is unchanged.
+modfile() { # FIELD KERNEL MODULE
+  local f=""
+  if [[ -z $root ]]; then
+    f=$(modinfo -k "$2" -F "$1" "$3" 2>/dev/null)
+    [[ -n $f ]] || f=$(modinfo -F "$1" "$3" 2>/dev/null)
+  else
+    f=$(modinfo -b "$root" -k "$2" -F "$1" "$3" 2>/dev/null)
+  fi
+  printf '%s\n' "$f"
+}
+
+smoke=0
+case "${1:-}" in
+  --installed)
+    kernels=("$root"/usr/lib/modules/*/build)
+    (( ${#kernels[@]} )) || { bad "no kernel headers are installed, so DKMS cannot build ane.ko"; finish; }
+    for b in "${kernels[@]}"; do k=${b%/build}; built "${k##*/}" ane; built "${k##*/}" ane_t6021; done
+    finish ;;
+  --smoke) smoke=1 ;;
+  "") ;;
+  *) echo "usage: omarchy-ane-check [--root DIR] [--installed | --smoke]" >&2; exit 2 ;;
+esac
+
+kver=$(uname -r)
+dt=$root/sys/firmware/devicetree/base
+echo "omarchy-ane-check: kernel $kver"
+
+# 0. SoC. The ANE has run on T8103, T6001 and T6021 only. Every other SoC
+#    gets an "UNTESTED SoC" line (README.md, "Chip coverage"), or a
+#    "DATA-ONLY SoC" line when omarchy-ane-dt status finds the package's data
+#    file for it (data/ane-soc/SOC.json): data, no driver.
+soc=""
+if [[ -r $dt/compatible ]]; then
+  while IFS= read -r -d '' c; do
+    [[ $c =~ ^apple,(t[0-9]+)$ ]] && { soc=${BASH_REMATCH[1]}; break; }
+  done <"$dt/compatible"
+fi
+mod=ane
+[[ $soc == t602? || $soc == t8112 ]] && mod=ane_t6021
+dtool=$(tool omarchy-ane-dt)
+dtstatus=""
+[[ -z $dtool ]] || dtstatus=$("$dtool" status ${root:+--root "$root"} 2>/dev/null)
+
+# dtbs_source: kernel when DTBS= in /etc/default/update-m1n1 makes m1n1 boot
+# the kernel's own device trees, so no overlay or opt-in key reaches it.
+dtbs=$(sed -n 's/^dtbs_source=//p' <<<"$dtstatus")
+[[ -z $dtbs ]] || echo "  dtbs_source=$dtbs"
+
+# driver_source: whose $mod this kernel runs. intree: the kernel's own, built
+# in or under kernel/ (kernel/drivers/accel/ane); dkms: another file,
+# omarchy-ane-dkms's under updates/dkms; none: no $mod for this kernel. A
+# loaded $mod counts by srcversion, so a DKMS copy installed over a loaded
+# in-tree driver reads intree until the reboot.
+mods=$root/usr/lib/modules/$kver
+own=("$mods"/kernel/drivers/accel/ane/"$mod".ko*)
+file=$(modfile filename "$kver" "$mod")
+grep -qx "kernel/drivers/accel/ane/$mod.ko" "$mods/modules.builtin" 2>/dev/null && own=("(builtin)") file="(builtin)"
+live=$(cat "$root/sys/module/$mod/srcversion" 2>/dev/null)
+for f in "${own[@]}"; do
+  [[ -n $live && $(modinfo -F srcversion "$f" 2>/dev/null) == "$live" ]] && file=$f
+done
+if [[ -z $root && -z $file ]]; then
+  loaded=$(modinfo -F filename "$mod" 2>/dev/null)
+  [[ $loaded == */kernel/* ]] && file=$loaded
+fi
+case $file in
+  "") src=none ;;
+  "(builtin)"|*/kernel/*) src=intree ;;
+  *) src=dkms ;;
+esac
+line="  $DRIVER_SOURCE=$src${file:+ ($mod: $file)}"
+(( ${#own[@]} )) && line+="; in-tree kernel: $INTREE_KERNEL"
+echo "$line"
+
+case $soc in
+  t8103|t6001|t6021|t6000|t6020|"") ;;
+  t6002|t6022|t8112)
+    steps=()
+    if [[ $dtbs == kernel* ]]; then
+      echo "UNTESTED SoC: $soc. $mod has not run on it. ${dtbs#kernel: }."
+      [[ $mod == ane_t6021 ]] && steps+=("sudo omarchy-ane-firmware-fetch")
+      steps+=("boot a kernel whose own device tree enables the $soc ANE node")
+    else
+      echo "UNTESTED SoC: $soc. $mod has not run on it. Its overlay applies only when ane-$soc is a line of /etc/omarchy-mac-boot/dtb-overlays.opt-in."
+      steps+=("echo ane-$soc | sudo tee -a /etc/omarchy-mac-boot/dtb-overlays.opt-in")
+      [[ $mod == ane_t6021 ]] && steps+=("sudo omarchy-ane-firmware-fetch")
+      steps+=("sudo omarchy-ane-dt apply" "sudo update-m1n1" "sudo reboot")
+    fi
+    echo "  To bring the chip up:"
+    for i in "${!steps[@]}"; do printf '    %d. %s\n' "$((i + 1))" "${steps[$i]}"; done
+    echo "  Then, from an omarchy-mlx checkout, when the machine is idle (load1 < 0.5 and PSI cpu avg10 0.00; no fixed uptime), submit a row:"
+    echo "    python3 scripts/collect_deep.py --ane-smoke --submit"
+    echo "  One passing judged row promotes the chip. tools/promotion_check.py prints the verdict." ;;
+  *)
+    if grep -qx "data-only (no driver): $soc" <<<"$dtstatus"; then
+      echo "DATA-ONLY SoC: $soc (no driver yet)"
+    else
+      echo "UNTESTED SoC: $soc"
+    fi
+    bad "no omarchy-ane driver supports the $soc ANE"; finish ;;
+esac
+
+# 1. T602x firmware: Linux starts it there. The kernel loads the Asahi vendor
+#    firmware copy (/usr/lib/firmware/vendor) first, else the file that
+#    omarchy-ane-firmware-fetch installs (90-omarchy-ane-firmware.hook on
+#    T6021). fetch --check checks the copy the kernel loads.
+if [[ $mod == ane_t6021 ]]; then
+  fwtool=$(tool omarchy-ane-firmware-fetch)
+  if [[ -z $fwtool ]]; then
+    bad "cannot check the ANE firmware: omarchy-ane-firmware-fetch is missing"
+  elif fw=$("$fwtool" --check ${root:+--root "$root"} 2>&1); then
+    ok "ANE firmware: $fw"
+  else
+    bad "${fw#omarchy-ane-firmware-fetch: }"
+  fi
+fi
+
+# 2. ANE node. Without it nothing else can pass, so stop here.
+compat=""
+for f in "$dt"/ane*@*/compatible "$dt"/*/ane*@*/compatible; do
+  c=$(tr '\0' '\n' <"$f" | grep -m1 -E '^apple,t[0-9a-z]+-ane$') || continue
+  st=${f%/compatible}/status status=okay
+  [[ -e $st ]] && status=$(tr -d '\0' <"$st")
+  [[ $status == okay ]] && { compat=$c; break; }
+done
+# Where the node comes from: omarchy-ane-dt status compares the running
+# kernel's board device tree with omarchy-ane's overlay.
+origin=$(sed -n 's/.* source=\([a-z]*\) .*/\1/p' <<<"$dtstatus")
+if [[ ! -d $dt ]]; then
+  bad "no device tree: this is not an Apple Silicon Linux system"; finish
+elif [[ -z $compat ]]; then
+  case $origin in
+    kernel) bad "no ANE node in the running device tree, but the kernel's DTB has one. m1n1 has an older device tree. Run: sudo update-m1n1, then reboot." ;;
+    overlay) bad "no ANE node in the running device tree, but the omarchy-ane overlay has one. m1n1 has an older device tree. Run: sudo update-m1n1, then reboot." ;;
+    *) if [[ $dtbs == kernel* ]]; then
+         bad "no ANE node in the running device tree, and ${dtbs#kernel: }"
+       else
+         bad "no ANE node: neither the kernel's DTB nor the omarchy-ane overlay has one. Run: sudo omarchy-ane-dt apply"
+       fi ;;
+  esac
+  finish
+fi
+case $origin in
+  kernel) ok "ANE device-tree node: $compat (DTB has node: kernel)" ;;
+  overlay) ok "ANE device-tree node: $compat (DTB has node: omarchy-ane overlay)" ;;
+  *) ok "ANE device-tree node: $compat (from a device tree outside the kernel package and omarchy-ane)" ;;
+esac
+
+# 3. Module built for the running kernel.
+built "$kver" "$mod"
+
+# 4. Module loaded.
+if [[ -d $root/sys/module/$mod ]]; then
+  ver=$(cat "$root/sys/module/$mod/version" 2>/dev/null)
+  ok "$mod is loaded${ver:+ (version $ver)}"
+  disk=$(modfile srcversion "$kver" "$mod")
+  live=$(cat "$root/sys/module/$mod/srcversion" 2>/dev/null)
+  if [[ -n $disk && -n $live && $disk != "$live" ]]; then
+    echo "  note  the loaded $mod differs from the installed $mod.ko. Reboot to load the new one. Do not rmmod $mod."
+  fi
+elif [[ $mod == ane_t6021 ]]; then
+  bad "ane_t6021 is not loaded. It loads at boot when the ANE node is present. Reboot."
+else
+  bad "ane is not loaded. Load it with: sudo modprobe ane"
+fi
+
+# 5. Driver bound to the ANE platform device.
+dev=""
+for l in "$root"/sys/bus/platform/drivers/"$mod"/*; do
+  [[ -L $l && ${l##*/} != module ]] && { dev=${l##*/}; break; }
+done
+if [[ -n $dev ]]; then
+  ok "$mod is bound to $dev"
+else
+  bad "$mod is bound to no device. Read the reason with: journalctl -k -g $mod"
+fi
+
+# 6. Device node. Every user must be able to open it. The package adds no
+#    udev rule: systemd's 50-udev-default.rules makes accel nodes mode 0666.
+node=""
+for s in "$root"/sys/class/accel/accel*; do
+  [[ $(readlink "$s/device/driver") == */"$mod" ]] && { node=$root/dev/accel/${s##*/}; break; }
+done
+if [[ -z $node || ! -c $node ]]; then
+  bad "no /dev/accel node from $mod"
+else
+  mode=$(stat -Lc '%A %U:%G' "$node")
+  if [[ $mode == c??????rw?\ * ]]; then
+    ok "$node present ($mode); every user can open it"
+  else
+    bad "$node is $mode, so not every user can open it. systemd's default rule makes accel nodes mode 0666. A udev rule on this system changed that."
+  fi
+fi
+
+# 7. Execution: omarchy-ane-smoke prints one line for people on stderr.
+if (( smoke && !fail )); then
+  st=$(tool omarchy-ane-smoke)
+  if [[ -z $st ]]; then
+    bad "cannot run the smoke: omarchy-ane-smoke is missing"
+  else
+    line=$("$st" ${root:+--root "$root"} 2>&1 >/dev/null)
+    case $? in
+      0) ok "smoke: ${line#omarchy-ane-smoke: }" ;;
+      2) echo "  note  smoke: ${line#omarchy-ane-smoke: }" ;;
+      *) bad "smoke: ${line#omarchy-ane-smoke: }" ;;
+    esac
+  fi
+fi
+
+finish

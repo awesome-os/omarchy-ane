@@ -1,0 +1,985 @@
+// SPDX-License-Identifier: MIT
+/* Copyright 2022 Eileen Yoon <eyn@gmx.com> */
+
+#include <asm/types.h>
+#include <drm.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <ane_accel.h>
+#include "ane.h"
+#include "ane_bind.h"
+#include "ane_m2.h"
+
+#ifndef LIBANE_CONFIG_NO_ERR
+#define ane_err(a, ...) fprintf(stderr, "LIBANE: ERR: " a, ##__VA_ARGS__)
+#else
+#define ane_err(...) \
+	do {         \
+	} while (0)
+#endif
+
+/*
+ * ANE_TRACE_TIMING set to anything but "" or "0": one stderr line per load
+ * stage and per ane_exec, "LIBANE: TIMING stage=NAME ms=MS bytes=N"
+ * (CLOCK_MONOTONIC; tools/ane_cold_start.py parses it). Unset: one
+ * predictable branch per stage, no clock read, no output.
+ */
+static int trace_timing = -1;
+
+static uint64_t timing_start(void)
+{
+	struct timespec ts;
+
+	if (trace_timing < 0) {
+		const char *v = getenv("ANE_TRACE_TIMING");
+
+		trace_timing = v && *v && strcmp(v, "0");
+	}
+	if (!trace_timing)
+		return 0;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static void timing_end(const char *stage, uint64_t start, uint64_t bytes)
+{
+	if (start)
+		fprintf(stderr, "LIBANE: TIMING stage=%s ms=%.3f bytes=%llu\n",
+			stage, (double)(timing_start() - start) / 1e6,
+			(unsigned long long)bytes);
+}
+
+/*
+ * ANE_LOAD_STAGED=1 restores the two-pass load: pread the payload into a
+ * malloc'd staging buffer, parse the task stream there, memcpy it into the
+ * buffer objects. Default (unset, empty, "0"): one pass -- the payload is
+ * loaded straight into the chans[0] mapping (mmap the file and memcpy)
+ * and parsed there, so a program is copied once, not twice, and no
+ * staging buffer stays resident. Read once per load, not a hot path.
+ * The M1 (ABI 1) path only.
+ */
+static int load_staged(void)
+{
+	const char *v = getenv("ANE_LOAD_STAGED");
+
+	return v && *v && strcmp(v, "0");
+}
+
+#define TILE_SHIFT_DEFAULT 0xEUL /* H13 island containers: 0x4000-B units */
+#define TILE_ALIGN	   0x4000UL
+
+#define tile_align(x) 	((((uint64_t)(x)) + TILE_ALIGN - 1) & -TILE_ALIGN)
+#define tile_size(nn, bdx) 	(((uint64_t)to_anec(nn)->tiles[bdx]) << (nn)->tile_shift)
+
+#define ANEC_HEADER_SIZE   0x1000UL
+#define src_bdx(nn, idx)   ((nn)->bind.src[idx])
+#define dst_bdx(nn, idx)   ((nn)->bind.dst[idx])
+
+#define MAX_ANE_DEVICES	   2
+#define MAX_NODE_LEN	   30
+#define MAX_NODE_COUNT	   64
+
+static inline void *ane_malloc(const uint64_t size)
+{
+	void *ptr = malloc(size);
+	if (ptr == NULL) {
+		ane_err("failed to malloc size 0x%lx\n", size);
+		return NULL;
+	}
+	return ptr;
+}
+
+static inline void *ane_zmalloc(const uint64_t size)
+{
+	void *ptr = malloc(size);
+	if (ptr == NULL) {
+		ane_err("failed to malloc size 0x%lx\n", size);
+		return NULL;
+	}
+	memset(ptr, 0, size);
+	return ptr;
+}
+
+static inline void set_nid(void *td, int nid)
+{
+	uint32_t hdr0 = *(uint32_t *)td;
+	hdr0 = (hdr0 & 0xf00ffff) | ((nid & 0xff) << 16);
+	memcpy(td, &hdr0, sizeof(uint32_t));
+}
+
+static inline void set_btsp_and_command(struct ane_nn *nn)
+{
+	const struct anec *anec = to_anec(nn);
+
+	memcpy(nn->chans[0].map, nn->data, anec->size);
+
+	/* do not fucking overflow */
+	memcpy(nn->btsp_chan.map, nn->data, anec->td_size);
+	set_nid(nn->btsp_chan.map, ANE_FIFO_NID);
+}
+
+static inline int bo_init(struct ane_nn *nn, struct ane_bo *bo)
+{
+	struct drm_ane_bo_init args = { .size = bo->size };
+	int err = ioctl(nn->fd, DRM_IOCTL_ANE_BO_INIT, &args);
+	if (err < 0) {
+		ane_err("DRM_IOCTL_ANE_BO_INIT failed with 0x%x\n", err);
+		return -EINVAL;
+	}
+
+	bo->handle = args.handle;
+	bo->offset = args.offset;
+
+	return 0;
+}
+
+static inline void bo_free(struct ane_nn *nn, struct ane_bo *bo)
+{
+	if (bo->handle) {
+		struct drm_ane_bo_free args = { .handle = bo->handle };
+		ioctl(nn->fd, DRM_IOCTL_ANE_BO_FREE, &args);
+	}
+	bo->handle = 0;
+	bo->offset = 0;
+}
+
+static inline int bo_mmap(struct ane_nn *nn, struct ane_bo *bo)
+{
+	bo->map = mmap(0, bo->size, PROT_READ | PROT_WRITE, MAP_SHARED, nn->fd,
+		       bo->offset);
+
+	if (bo->map == MAP_FAILED) {
+		bo->map = NULL;
+		ane_err("failed to mmap bo size 0x%lx\n", bo->size);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static inline void bo_munmap(struct ane_nn *nn, struct ane_bo *bo)
+{
+	(void)nn;
+	if (bo->map) {
+		munmap(bo->map, bo->size);
+	}
+	bo->map = NULL;
+}
+
+static inline int ane_bo_init(struct ane_nn *nn, struct ane_bo *bo)
+{
+	uint64_t t;
+	int err;
+
+	if (!bo->size)
+		return -EINVAL;
+
+	t = timing_start();
+	err = bo_init(nn, bo);
+	if (err < 0) {
+		return err;
+	}
+	timing_end("bo_init", t, bo->size);
+
+	t = timing_start();
+	err = bo_mmap(nn, bo);
+	if (err < 0) {
+		bo_free(nn, bo);
+		return err;
+	}
+	timing_end("bo_mmap", t, bo->size);
+
+	return 0;
+}
+
+static inline void ane_bo_free(struct ane_nn *nn, struct ane_bo *bo)
+{
+	bo_munmap(nn, bo);
+	bo_free(nn, bo);
+}
+
+static inline void ane_chan_free(struct ane_nn *nn)
+{
+	ane_bo_free(nn, &nn->btsp_chan);
+
+	for (int bdx = 0; bdx < ANE_TILE_COUNT; bdx++) {
+		ane_bo_free(nn, &nn->chans[bdx]);
+	}
+}
+
+static inline int ane_place_program(struct ane_nn *nn, const char *path);
+
+static inline int ane_chan_init(struct ane_nn *nn, const char *path,
+				int staged)
+{
+	const struct anec *anec = to_anec(nn);
+	struct ane_bo *bo;
+	uint64_t t;
+	int err;
+
+	for (int bdx = 0; bdx < ANE_TILE_COUNT; bdx++) {
+		if (anec->tiles[bdx]) {
+			bo = &nn->chans[bdx];
+			bo->size = tile_size(nn, bdx);
+			err = ane_bo_init(nn, bo);
+			if (err < 0)
+				goto error;
+		}
+	}
+
+	bo = &nn->btsp_chan;
+	bo->size = tile_align(anec->td_size);
+	err = ane_bo_init(nn, bo);
+	if (err < 0)
+		goto error;
+
+	if (!staged) {
+		err = ane_place_program(nn, path);
+		if (err < 0) {
+			ane_chan_free(nn);
+		}
+		return err;
+	}
+
+	t = timing_start();
+	set_btsp_and_command(nn);
+	timing_end("copy", t, anec->size + anec->td_size);
+
+	return 0;
+
+error:
+	ane_err("failed to init memory-mapped channels\n");
+	ane_chan_free(nn);
+	return err;
+}
+
+static inline int ane_fread(const char *fname, void *data, uint64_t size)
+{
+	uint64_t done;
+	FILE *fp = fopen(fname, "rb");
+	if (!fp) {
+		ane_err("failed to open file %s", fname);
+		return -EINVAL;
+	}
+
+	done = fread((char *)data, sizeof(char), size, fp);
+	if (done != size) {
+		ane_err("only read 0x%zx/0x%zx requested\n", done, size);
+	}
+
+	fclose(fp);
+	return 0;
+}
+
+static inline int ane_fwrite(const char *fname, void *data, uint64_t size)
+{
+	uint64_t done;
+	FILE *fp = fopen(fname, "wb");
+	if (!fp) {
+		ane_err("failed to open file %s", fname);
+		return -EINVAL;
+	}
+
+	done = fwrite((char *)data, sizeof(char), size, fp);
+	if (done != size) {
+		ane_err("only wrote 0x%zx/0x%zx requested\n", done, size);
+	}
+
+	fclose(fp);
+	return 0;
+}
+
+/* Bytes read (a short file reads fewer than size), or -EINVAL. */
+static inline int64_t ane_pread(const char *fname, void *data, uint64_t size,
+				uint64_t offset)
+{
+	uint64_t done;
+	FILE *fp = fopen(fname, "rb");
+	if (!fp) {
+		ane_err("failed to open file %s", fname);
+		return -EINVAL;
+	}
+
+	/* Set the file position indicator in front of third double value. */
+	if (fseek(fp, offset, SEEK_SET) != 0) {
+		ane_err("fseek() failed on file %s", fname);
+		fclose(fp);
+		return -EINVAL;
+	}
+
+	done = fread((char *)data, sizeof(char), size, fp);
+	if (done != size) {
+		ane_err("only read 0x%zx/0x%zx requested\n", done, size);
+	}
+
+	fclose(fp);
+	return (int64_t)done;
+}
+
+/* Bulk payload into the program buffer object (direct path). mmap the file
+ * and memcpy: one userspace pass, no intermediate buffer (a pread makes the
+ * kernel copy per page-cache page; the memcpy runs at mapping speed). Short
+ * file: copy only what is there, the caller zeroes the tail -- the same
+ * bytes the staged path's fread + memset produced. Falls back to ane_pread
+ * when the file cannot be mapped. Returns bytes copied, or -EINVAL. */
+static inline int64_t ane_load_payload(const char *path, void *dst,
+					       uint64_t size)
+{
+	struct stat st;
+	void *src;
+	uint64_t have;
+	uint64_t t;
+	int64_t done = -EINVAL;
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+
+	if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size > (off_t)ANEC_HEADER_SIZE) {
+		t = timing_start();
+		src = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE,
+			   fd, 0);
+		if (src != MAP_FAILED) {
+			have = (uint64_t)st.st_size - ANEC_HEADER_SIZE;
+			if (have > size) {
+				have = size;
+			}
+			timing_end("model_map", t, 0);
+			t = timing_start();
+			memcpy(dst, (uint8_t *)src + ANEC_HEADER_SIZE, have);
+			timing_end("model_map_copy", t, have);
+			done = (int64_t)have;
+			munmap(src, (size_t)st.st_size);
+		}
+	}
+	if (fd >= 0) {
+		close(fd);
+	}
+	if (done >= 0) {
+		return done;
+	}
+	t = timing_start();
+	done = ane_pread(path, dst, size, ANEC_HEADER_SIZE);
+	timing_end("model_pread_fallback", t, size);
+	return done;
+}
+
+/* Direct load (default): the payload is loaded straight into the chans[0]
+ * mapping -- the file's bytes land in the buffer object once, no staging
+ * buffer -- then the task stream is parsed in place, and only the td copy
+ * to the bootstrap channel remains. Byte-identical to the staged path: a
+ * short file leaves the same zero tail, because fresh BO pages are zero. */
+static inline int ane_place_program(struct ane_nn *nn, const char *path)
+{
+	const struct anec *anec = to_anec(nn);
+	uint32_t channel;
+	uint64_t need;
+	uint64_t have;
+	uint64_t t;
+	int64_t got;
+
+	got = ane_load_payload(path, nn->chans[0].map, anec->size);
+	if (got < 0) {
+		return -EINVAL;
+	}
+	t = timing_start();
+	memset((uint8_t *)nn->chans[0].map + got, 0,
+	       anec->size - (uint64_t)got);
+	timing_end("model_zero_tail", t, anec->size - (uint64_t)got);
+
+	t = timing_start();
+	if (!ane_bind_init(anec, nn->chans[0].map, anec->size, &nn->bind)) {
+		ane_err("%s: task stream does not name every surface; "
+			"channel map is positional\n", path);
+#ifdef LIBANE_CONFIG_STRICT_BIND
+		return -EINVAL;
+#endif
+	}
+
+	if (ane_bind_overrun(anec, nn->chans[0].map, anec->size,
+			     nn->tile_shift, &channel, &need, &have)) {
+		ane_err("%s: surface channel %u needs %llu bytes but is allocated "
+			"%llu; refusing the program\n",
+			path, channel, (unsigned long long)need,
+			(unsigned long long)have);
+		return -EINVAL;
+	}
+	timing_end("bind_check", t, anec->size);
+
+	t = timing_start();
+	memcpy(nn->btsp_chan.map, nn->chans[0].map, anec->td_size);
+	set_nid(nn->btsp_chan.map, ANE_FIFO_NID);
+	timing_end("copy", t, anec->td_size);
+
+	return 0;
+}
+
+static inline int is_ane_device(int fd, int *abi_major)
+{
+	drm_version_t version = {};
+	int err = ioctl(fd, DRM_IOCTL_VERSION, &version);
+	if (err < 0) {
+		ane_err("failed to get drm version with %d", err);
+		return -EINVAL;
+	}
+
+	if (!version.name_len) {
+		return -EINVAL;
+	}
+	/* ABI 1 is the M1 submit path; ABI 2 is the T6021 program path
+	 * (ane_accel.h). Anything else is not this driver. */
+	if (version.version_major != ANE_ABI_MAJOR &&
+	    version.version_major != ANE_ABI_M2_MAJOR) {
+		return -EINVAL;
+	}
+
+	version.name = (char *)ane_malloc(version.name_len + 1);
+	version.date_len = 0;
+	version.desc_len = 0;
+
+	err = ioctl(fd, DRM_IOCTL_VERSION, &version);
+	if (err < 0) {
+		ane_err("failed to get drm version with %d", err);
+		free(version.name);
+		return -EINVAL;
+	}
+
+	/* Results might not be null-terminated strings */
+	version.name[version.name_len] = '\0';
+	if (strcmp(version.name, "ane") != 0) {
+		free(version.name);
+		return -EINVAL;
+	}
+
+	free(version.name);
+
+	*abi_major = version.version_major;
+	return 0;
+}
+
+static inline int open_fd(const char *node, int *abi_major)
+{
+	int fd = open(node, O_RDWR | O_CLOEXEC, S_IRUSR | S_IWUSR);
+	if (fd < 0) {
+		return -ENODEV;
+	}
+
+	if (is_ane_device(fd, abi_major) < 0) {
+		close(fd);
+		return -EINVAL;
+	}
+
+	return fd;
+}
+
+static inline int device_open(int dev_id, int *abi_major)
+{
+	int fd;
+	char node[MAX_NODE_LEN];
+	int found = 0;
+
+	if (dev_id < 0 || dev_id >= MAX_ANE_DEVICES) {
+		ane_err("invalid dev_id; 0 <= dev_id <= %d\n",
+			MAX_ANE_DEVICES - 1);
+		return -EINVAL;
+	}
+
+	for (int i = 0; i < MAX_NODE_COUNT; i++) {
+		snprintf(node, MAX_NODE_LEN, "/dev/accel/accel%d", i);
+
+		fd = open_fd(node, abi_major);
+		if (fd < 0) {
+			continue;
+		}
+
+		if (dev_id == found) {
+			return fd;
+		}
+
+		found++;
+		close(fd);
+	}
+
+	ane_err("failed to find device with dev_id %d\n", dev_id);
+	return -ENODEV;
+}
+
+static inline void device_close(int fd)
+{
+	if (!(fd < 0)) {
+		close(fd);
+	}
+}
+
+static inline int ane_device_open(struct ane_nn *nn, int dev_id,
+				  int *abi_major)
+{
+	int fd = device_open(dev_id, abi_major);
+	if (fd < 0) {
+		return -EINVAL;
+	}
+
+	nn->fd = fd;
+
+	return 0;
+}
+
+static inline void ane_device_close(struct ane_nn *nn)
+{
+	device_close(nn->fd);
+	nn->fd = 0;
+}
+
+static inline int ane_model_init(struct ane_nn *nn, const char *path,
+				 int staged)
+{
+	struct anec *anec = to_anec(nn);
+	uint32_t channel;
+	uint64_t need;
+	uint64_t have;
+	uint64_t t = timing_start();
+	int64_t got;
+
+	if (ane_fread(path, anec, sizeof(struct anec)) < 0) {
+		return -EINVAL;
+	}
+
+	if (!anec->size) {
+		ane_err("invalid anec at %s\n", path);
+		return -EINVAL;
+	}
+
+	if (!staged) {
+		/* Direct load: the payload lands in the chans[0] buffer
+		 * object and is parsed there (ane_chan_init), so no
+		 * staging buffer exists and nn->data stays NULL. */
+		timing_end("model_header", t, sizeof(*anec));
+		return 0;
+	}
+
+	/* 16 KiB aligned and zero past a short read, as before. pread fills
+	 * the rest, so a full program pays no memset pass. */
+	if (posix_memalign(&nn->data, TILE_ALIGN, anec->size)) {
+		ane_err("failed to allocate 0x%llx bytes for %s\n",
+			(unsigned long long)anec->size, path);
+		nn->data = NULL;
+		return -ENOMEM;
+	}
+
+	got = ane_pread(path, nn->data, anec->size, ANEC_HEADER_SIZE);
+	if (got < 0) {
+		free(nn->data);
+		return -EINVAL;
+	}
+	memset((uint8_t *)nn->data + got, 0, anec->size - (uint64_t)got);
+	timing_end("model_read", t, anec->size);
+
+	t = timing_start();
+	if (!ane_bind_init(anec, nn->data, anec->size, &nn->bind)) {
+		ane_err("%s: task stream does not name every surface; "
+			"channel map is positional\n", path);
+#ifdef LIBANE_CONFIG_STRICT_BIND
+		free(nn->data);
+		return -EINVAL;
+#endif
+	}
+
+	if (ane_bind_overrun(anec, nn->data, anec->size, nn->tile_shift,
+			     &channel, &need, &have)) {
+		ane_err("%s: surface channel %u needs %llu bytes but is allocated "
+			"%llu; refusing the program\n",
+			path, channel, (unsigned long long)need,
+			(unsigned long long)have);
+		free(nn->data);
+		return -EINVAL;
+	}
+
+	timing_end("bind_check", t, anec->size);
+	return 0;
+}
+
+static inline void ane_model_free(struct ane_nn *nn)
+{
+	free(nn->data);
+}
+
+static struct ane_nn *ane_init_common(const char *path, int dev_id,
+				      uint32_t tile_shift,
+				      const struct ane_m2_port_spec *ports,
+				      uint32_t port_count)
+{
+	struct ane_nn *nn;
+	int abi_major = 0;
+	int staged;
+	uint64_t total = timing_start();
+	uint64_t t;
+
+	staged = load_staged();
+
+	if (!tile_shift || tile_shift > 20) {
+		ane_err("refusing tile shift %u (must be 1..20)\n",
+			tile_shift);
+		return NULL;
+	}
+
+	nn = ane_zmalloc(sizeof(struct ane_nn));
+	if (!nn) {
+		return NULL;
+	}
+	nn->tile_shift = tile_shift;
+
+	t = timing_start();
+	if (ane_device_open(nn, dev_id, &abi_major) < 0) {
+		ane_err("failed to open device with dev_id %d\n", dev_id);
+		free(nn);
+		return NULL;
+	}
+	timing_end("device_open", t, 0);
+
+	/* ABI 2 (T6021): sections + program/procedure on the accel node; the
+	 * M1 channel machinery does not apply. */
+	if (abi_major == ANE_ABI_M2_MAJOR) {
+		t = timing_start();
+		if (ane_m2_open(nn, path, ports, port_count) < 0) {
+			ane_err("failed to load ABI-2 program from %s\n",
+				path);
+			ane_device_close(nn);
+			free(nn);
+			return NULL;
+		}
+		timing_end("m2_open", t, 0);
+		timing_end("init_total", total, 0);
+		return nn;
+	}
+
+	if (ports) {
+		ane_err("port tables need the ABI-2 (T6021) device\n");
+		ane_device_close(nn);
+		free(nn);
+		return NULL;
+	}
+
+	if (ane_model_init(nn, path, staged) < 0) {
+		ane_err("failed to load anec from %s\n", path);
+		ane_device_close(nn);
+		free(nn);
+		return NULL;
+	}
+
+	if (ane_chan_init(nn, path, staged) < 0) {
+		ane_err("failed to init memory-mapped chans\n");
+		ane_device_close(nn);
+		ane_model_free(nn);
+		free(nn);
+		return NULL;
+	}
+
+	timing_end("init_total", total, to_anec(nn)->size);
+	return nn;
+}
+
+struct ane_nn *__ane_init_shift(const char *path, int dev_id,
+				uint32_t tile_shift)
+{
+	return ane_init_common(path, dev_id, tile_shift, NULL, 0);
+}
+
+struct ane_nn *ane_m2_init_ports(const char *path,
+				 const struct ane_m2_port_spec *ports,
+				 uint32_t port_count, int dev_id)
+{
+	return ane_init_common(path, dev_id, TILE_SHIFT_DEFAULT, ports,
+			       port_count);
+}
+
+struct ane_nn *__ane_init(const char *path, int dev_id)
+{
+	return __ane_init_shift(path, dev_id, TILE_SHIFT_DEFAULT);
+}
+
+void __ane_free(struct ane_nn *nn)
+{
+	if (nn->m2) {
+		ane_m2_close(nn);
+	} else {
+		ane_chan_free(nn);
+	}
+	ane_device_close(nn);
+	ane_model_free(nn);
+	free(nn);
+}
+
+static int ane_exec_with_state_swap(struct ane_nn *nn, int swap_state,
+				    uint32_t state_src_idx,
+				    uint32_t state_dst_idx)
+{
+	const struct anec *anec = to_anec(nn);
+	struct drm_ane_submit args;
+
+	memset(&args, 0, sizeof(args));
+
+	args.tsk_size = anec->tsk_size;
+	args.td_count = anec->td_count;
+	args.td_size = anec->td_size;
+
+	for (int bdx = 0; bdx < ANE_TILE_COUNT; bdx++) {
+		if (anec->tiles[bdx]) {
+			args.handles[bdx] = nn->chans[bdx].handle;
+		}
+	}
+
+	if (swap_state) {
+		uint32_t src = src_bdx(nn, state_src_idx);
+		uint32_t dst = dst_bdx(nn, state_dst_idx);
+		uint32_t handle = args.handles[src];
+		args.handles[src] = args.handles[dst];
+		args.handles[dst] = handle;
+	}
+	args.btsp_handle = nn->btsp_chan.handle;
+
+	return ioctl(nn->fd, DRM_IOCTL_ANE_SUBMIT, &args);
+}
+
+int ane_exec(struct ane_nn *nn)
+{
+	uint64_t t = timing_start();
+	int ret = nn->m2 ? ane_m2_exec(nn) :
+			   ane_exec_with_state_swap(nn, 0, 0, 0);
+
+	timing_end("exec", t, 0);
+	return ret;
+}
+
+int ane_exec_loop(struct ane_nn *nn, uint32_t iterations,
+		  uint32_t state_src_idx, uint32_t state_dst_idx)
+{
+	if (nn->m2)
+		return -EOPNOTSUPP;
+	if (!iterations || state_src_idx >= ane_src_count(nn) ||
+	    state_dst_idx >= ane_dst_count(nn)) {
+		return -EINVAL;
+	}
+	if (__ane_src_size(nn, state_src_idx) !=
+	    __ane_dst_size(nn, state_dst_idx)) {
+		return -EINVAL;
+	}
+	for (uint32_t iteration = 0; iteration < iterations; iteration++) {
+		int ret = ane_exec_with_state_swap(nn, iteration & 1,
+						   state_src_idx,
+						   state_dst_idx);
+		if (ret < 0) {
+			return ret;
+		}
+	}
+	return 0;
+}
+
+uint64_t ane_kernel_capacity(struct ane_nn *nn)
+{
+	const struct anec *anec = to_anec(nn);
+	uint64_t offset = (anec->tsk_size + 15) & ~15ULL;
+	return offset <= nn->chans[0].size ? nn->chans[0].size - offset : 0;
+}
+
+int ane_bind_kernel(struct ane_nn *nn, const void *from, uint64_t size)
+{
+	const struct anec *anec = to_anec(nn);
+	uint64_t offset = (anec->tsk_size + 15) & ~15ULL;
+	uint64_t capacity = ane_kernel_capacity(nn);
+	if (!from || size > capacity ||
+	    offset + size > nn->chans[0].size)
+		return -EINVAL;
+	memcpy((uint8_t *)nn->chans[0].map + offset, from, size);
+	return 0;
+}
+
+#ifndef LIBANE_CONFIG_NO_INDEX_CHECK
+#define INDEX_CHECK(cnt, idx, ret)                                             \
+	({                                                                     \
+		if (idx >= cnt) {                                              \
+			ane_err("tried to index %d but max is %d; bailing.\n", \
+				idx, cnt);                                     \
+			return ret;                                            \
+		}                                                              \
+	})
+#else
+#define INDEX_CHECK(nn, idx, ret) \
+	do {                      \
+	} while (0)
+#endif /* LIBANE_CONFIG_NO_INDEX_CHECK */
+
+uint64_t __ane_src_size(struct ane_nn *nn, const uint32_t idx)
+{
+	if (nn->m2) {
+		return ane_m2_src_size(nn, idx);
+	}
+	INDEX_CHECK(ane_src_count(nn), idx, 0);
+	return tile_size(nn, src_bdx(nn, idx));
+}
+
+uint64_t __ane_dst_size(struct ane_nn *nn, const uint32_t idx)
+{
+	if (nn->m2) {
+		return ane_m2_dst_size(nn, idx);
+	}
+	INDEX_CHECK(ane_dst_count(nn), idx, 0);
+	return tile_size(nn, dst_bdx(nn, idx));
+}
+
+/* The M2 port model, not the ANEC header, counts the M2 io: the header
+ * of an Apple-compiled ANEC records one output however many the port
+ * table binds, so the legacy index check would skip every later one. */
+void __ane_send(struct ane_nn *nn, void *from, const uint32_t idx)
+{
+	if (nn->m2) {
+		ane_m2_send(nn, from, idx);
+		return;
+	}
+	INDEX_CHECK(ane_src_count(nn), idx, );
+	memcpy(nn->chans[src_bdx(nn, idx)].map, from,
+	       tile_size(nn, src_bdx(nn, idx)));
+}
+
+void __ane_read(struct ane_nn *nn, void *to, const uint32_t idx)
+{
+	if (nn->m2) {
+		ane_m2_read(nn, to, idx);
+		return;
+	}
+	INDEX_CHECK(ane_dst_count(nn), idx, );
+	memcpy(to, nn->chans[dst_bdx(nn, idx)].map,
+	       tile_size(nn, dst_bdx(nn, idx)));
+}
+
+// clang-format off
+void ane_tile(void *data, void *tile, const uint64_t N, const uint64_t C,
+	      const uint64_t H, const uint64_t W, const uint64_t P,
+	      const uint64_t R)
+{
+	const uint64_t new_H = P / R;
+	const uint64_t new_W = R / sizeof(uint16_t);
+	const uint64_t stride = W * sizeof(uint16_t);
+
+	const uint64_t C0 = C * H * W;
+	const uint64_t C1 = C * new_H * new_W;
+	const uint64_t H0 = H * W;
+	const uint64_t H1 = new_H * new_W;
+
+	if ((new_H == H) && (new_W == W)) {
+		memcpy(tile, data, N * C * P);
+		return;
+	}
+
+	memset(tile, 0, N * C * P);
+
+	for (uint64_t n = 0; n < N; n++) {
+		for (uint64_t c = 0; c < C; c++) {
+			for (uint64_t h = 0; h < H; h++) {
+				void *src = ((void *)(data)) + ((n * C0 + c * H0 + h * W) * sizeof(uint16_t));
+				void *dst = ((void *)(tile)) + ((n * C1 + c * H1 + h * new_W) * sizeof(uint16_t));
+				memcpy(dst, src, stride);
+			}
+		}
+	}
+	return;
+}
+
+void ane_untile(void *data, void *tile, const uint64_t N, const uint64_t C,
+		const uint64_t H, const uint64_t W, const uint64_t P,
+		const uint64_t R)
+{
+	const uint64_t new_H = P / R;
+	const uint64_t new_W = R / sizeof(uint16_t);
+	const uint64_t stride = W * sizeof(uint16_t);
+
+	const uint64_t C0 = C * H * W;
+	const uint64_t C1 = C * new_H * new_W;
+	const uint64_t H0 = H * W;
+	const uint64_t H1 = new_H * new_W;
+
+	if ((new_H == H) && (new_W == W)) {
+		memcpy(data, tile, N * C * H * W * sizeof(uint16_t));
+		return;
+	}
+
+	memset(data, 0, N * C * H * W * sizeof(uint16_t));
+
+	for (uint64_t n = 0; n < N; n++) {
+		for (uint64_t c = 0; c < C; c++) {
+			for (uint64_t h = 0; h < H; h++) {
+				void *src = ((void *)(tile)) + ((n * C1 + c * H1 + h * new_W) * sizeof(uint16_t));
+				void *dst = ((void *)(data)) + ((n * C0 + c * H0 + h * W) * sizeof(uint16_t));
+				memcpy(dst, src, stride);
+			}
+		}
+	}
+	return;
+}
+
+void ane_set_oracle_nchw(struct ane_nn *nn, uint32_t ch, const uint64_t nchw[6])
+{
+	if (ch >= TILE_COUNT) {
+		return;
+	}
+	for (uint32_t i = 0; i < 6; i++) {
+		nn->anec.nchw[ch][i] = nchw[i];
+	}
+}
+// clang-format on
+
+/* ane_tile/ane_untile write and read the whole header geometry of a channel;
+ * refuse one whose span runs past the channel's mapping. */
+static int tile_fits(struct ane_nn *nn, const int bdx)
+{
+	const struct anec *anec = to_anec(nn);
+	uint64_t geometry[6];
+	uint64_t span;
+
+	for (int i = 0; i < 6; i++)
+		geometry[i] = anec->nchw[bdx][i];
+	span = ane_bind_tile_span(geometry);
+	if (span <= nn->chans[bdx].size)
+		return 1;
+	ane_err("channel %d geometry spans %llu bytes past its %llu-byte "
+		"mapping; refusing the transfer\n",
+		bdx, (unsigned long long)span,
+		(unsigned long long)nn->chans[bdx].size);
+	return 0;
+}
+
+int __ane_tile_send(struct ane_nn *nn, void *from, const uint32_t idx)
+{
+	const struct anec *anec = to_anec(nn);
+	int bdx;
+
+	INDEX_CHECK(ane_src_count(nn), idx, -EINVAL);
+	bdx = src_bdx(nn, idx);
+	if (!tile_fits(nn, bdx))
+		return -EINVAL;
+	ane_tile(from, nn->chans[bdx].map, anec->nchw[bdx][0],
+		 anec->nchw[bdx][1], anec->nchw[bdx][2], anec->nchw[bdx][3],
+		 anec->nchw[bdx][4], anec->nchw[bdx][5]);
+	return 0;
+}
+
+int __ane_tile_read(struct ane_nn *nn, void *to, const uint32_t idx)
+{
+	const struct anec *anec = to_anec(nn);
+	int bdx;
+
+	INDEX_CHECK(ane_dst_count(nn), idx, -EINVAL);
+	bdx = dst_bdx(nn, idx);
+	if (!tile_fits(nn, bdx))
+		return -EINVAL;
+	ane_untile(to, nn->chans[bdx].map, anec->nchw[bdx][0],
+		   anec->nchw[bdx][1], anec->nchw[bdx][2], anec->nchw[bdx][3],
+		   anec->nchw[bdx][4], anec->nchw[bdx][5]);
+	return 0;
+}

@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""Offline checks for packaging/omarchy-ane-firmware-fetch. No network.
+The pin must equal the driver's pin, or the tool installs bytes the driver rejects.
+"""
+import contextlib
+import hashlib
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+import io
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+sys.dont_write_bytecode = True  # keep packaging/ free of __pycache__
+
+root = Path(__file__).resolve().parents[1]
+spec = spec_from_loader('fetch', SourceFileLoader('fetch', str(root / 'packaging/omarchy-ane-firmware-fetch')))
+fetch = module_from_spec(spec)
+spec.loader.exec_module(fetch)
+
+# 1. Each chip's pin, size and file name agree with the driver's image
+# (ane/t6021/ane_fw_validate.h through ane_t602x_soc.fw in ane_t6021_fwload.c;
+# ane/h16/ane_h16_soc.c ane_h16_soc.fw for the H16 chips).
+validate = (root / 'ane/t6021/ane_fw_validate.h').read_text()
+fwload = (root / 'ane/t6021/ane_t6021_fwload.c').read_text()
+h16soc = (root / 'ane/h16/ane_h16_soc.c').read_text()
+def image(text, struct, var):
+    body = text.split(f'static const struct {struct} {var} = {{', 1)[1].split('\n};', 1)[0]
+    sha = body.split('.sha256 = {', 1)[1].split('}', 1)[0]
+    return (re.search(r'\.name = "([^"]+)"', body).group(1),
+            int(re.search(r'\.size = (0x[0-9a-f]+)', body).group(1), 16),
+            bytes(int(b, 16) for b in re.findall(r'0x([0-9a-f]{2})', sha)).hex())
+for chip, row in fetch.FETCH.items():
+    assert row[4] in fetch.IPSW, chip
+    if chip.split(',')[1] in ('t8132', 't6040', 't6041'):
+        soc = h16soc.split(f'ane_{chip.split(",")[1]}_soc = {{', 1)[1].split('\n};', 1)[0]
+        got = image(h16soc, 'ane_h16_fw', re.search(r'\.fw = &(\w+)', soc).group(1))
+    else:
+        soc = fwload.split(f'ane_{chip.split(",")[1]}_soc = {{', 1)[1].split('\n};', 1)[0]
+        got = image(validate, 'ane_fw_image', re.search(r'\.fw = &(\w+)', soc).group(1))
+    assert got == row[1:4], (chip, got)
+
+# 2. IM4P unwrap: short and long DER lengths; anything else is refused.
+def der(tag, body):
+    n = len(body)
+    head = bytes([n]) if n < 0x80 else bytes([0x80 | 3]) + n.to_bytes(3, 'big')
+    return bytes([tag]) + head + body
+
+payload = b'\xcf\xfa\xed\xfe' + bytes(300)
+im4p = der(0x30, der(0x16, b'IM4P') + der(0x16, b'anef') + der(0x16, b'1') + der(0x04, payload))
+assert fetch.im4p_payload(im4p) == payload
+for bad in (im4p[:-1], der(0x30, der(0x16, b'IMG4') + im4p[2:]), b''):
+    try:
+        fetch.im4p_payload(bad)
+        raise AssertionError('accepted a bad IM4P')
+    except fetch.Refuse:
+        pass
+
+# 3. Wrong bytes never pass verify.
+try:
+    fetch.verify(bytes(fetch.SELENE[2]), fetch.SELENE[2], fetch.SELENE[3])
+    raise AssertionError('verify accepted unpinned bytes')
+except fetch.Refuse:
+    pass
+
+# 4. Chip and version gates run before any network access and write nothing.
+def system(compat, version):
+    t = Path(tempfile.mkdtemp())
+    dt = t / 'sys/firmware/devicetree/base'
+    (dt / 'chosen').mkdir(parents=True)
+    (dt / 'compatible').write_bytes(b'\0'.join(compat) + b'\0')
+    (dt / 'chosen/asahi,os-fw-version').write_bytes(version + b'\0')
+    return t
+
+fetch.IPSW = {v: 'http://127.0.0.1:9/unreachable' for v in fetch.IPSW}
+assert fetch.main(['--root', str(system([b'apple,j293', b'apple,t8103'], b'13.5'))]) == 0
+for compat, version in (([b'apple,j414c', b'apple,t6021'], b'14.8.3'),
+                        ([b'apple,j413', b'apple,t8112'], b'14.8.3'),
+                        ([b'apple,j414c', b'apple,t6021'], b'13.5')):  # offline
+    t = system(compat, version)
+    assert fetch.main(['--root', str(t)]) == 1
+    assert not (t / 'usr').exists()
+
+# T6020, T6022 and T8112 pass the chip gate; an unknown chip does not.
+for compat, gate in (([b'apple,j414s', b'apple,t6020'], True),
+                     ([b'apple,j180d', b'apple,t6022'], True),
+                     ([b'apple,j413', b'apple,t8112'], True),
+                     ([b'apple,j504', b'apple,t8122'], False)):
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        assert fetch.main(['--root', str(system(compat, b'13.5'))]) == 1
+    assert ('cannot fetch' in err.getvalue()) == gate, (compat, err.getvalue())
+
+# H16 chips pin the macOS 27.0 payloads: a 27.0 stub fetches (offline here), a
+# stub whose version is not pinned refuses before the network, and a stub that
+# is not the pin's own IPSW version refuses: iBoot preloads from the stub.
+for compat, version, want in (([b'apple,j604', b'apple,t8132'], b'27.0', 'cannot fetch'),
+                              ([b'apple,j604', b'apple,t8132'], b'13.5', 'is from the macOS 27.0 IPSW'),
+                              ([b'apple,j614s', b'apple,t6040'], b'26.0.1', 'no pinned ANE image')):
+    t = system(compat, version)
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        assert fetch.main(['--root', str(t)]) == 1
+    assert want in err.getvalue(), (version, err.getvalue())
+    assert not (t / 'usr').exists()
+
+# The M3 family (H15) refuses by name until a receipt pins its stub image and
+# payload SHA-256; the refusal names the probe field that fills the hole.
+for compat in ([b'apple,j433', b'apple,t8122'], [b'apple,j514s', b'apple,t6030'],
+               [b'apple,j514c', b'apple,t6031'], [b'apple,j514m', b'apple,t6034']):
+    t = system(compat, b'27.0')
+    for args in (['--root', str(t)], ['--check', '--root', str(t)]):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            assert fetch.main(args) == 1
+        # One buffer per call: each of run() and --check must refuse by itself.
+        assert 'no pinned ANE payload' in err.getvalue() and 'os_fw_version' in err.getvalue(), \
+            (args[0], err.getvalue())
+    assert not (t / 'usr').exists()
+
+# 5. --hook (pacman): the hook fetches where the ANE is on by default
+# (firmware-fetch DEFAULT_ON, which mirrors the overlays table); a failed
+# fetch or a system without a device tree is a note, exit 0. Derived, so a
+# promotion flip (tools/promote_chip.py) keeps this suite green.
+for compat, chip in (([b'apple,j414c', b'apple,t6021'], 'apple,t6021'),
+                     ([b'apple,j414s', b'apple,t6020'], 'apple,t6020'),
+                     ([b'apple,j413', b'apple,t8112'], 'apple,t8112'),
+                     ([b'apple,j293', b'apple,t8103'], 'apple,t8103')):
+    tries = chip in fetch.DEFAULT_ON
+    t, out, err = system(compat, b'13.5'), io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        assert fetch.main(['--hook', '--root', str(t)]) == 0
+    assert ('cannot fetch' in err.getvalue()) == tries, (compat, out.getvalue(), err.getvalue())
+    assert not (t / 'usr').exists()
+with contextlib.redirect_stderr(io.StringIO()):
+    assert fetch.main(['--hook', '--root', tempfile.mkdtemp()]) == 0
+
+# 6. --check reads only the installed file of this chip.
+t = system([b'apple,j414c', b'apple,t6021'], b'13.5')
+dest = t / 'usr/lib/firmware' / fetch.FETCH['apple,t6021'][1]
+err = io.StringIO()
+with contextlib.redirect_stderr(err):
+    assert fetch.main(['--check', '--root', str(t)]) == 1
+assert 'is missing. Run: sudo omarchy-ane-firmware-fetch' in err.getvalue(), err.getvalue()
+dest.parent.mkdir(parents=True)
+dest.write_bytes(b'not the pin')
+with contextlib.redirect_stderr(io.StringIO()):
+    assert fetch.main(['--check', '--root', str(t)]) == 1
+fetch.FETCH['apple,t6021'] = (*fetch.SELENE[:2], len(b'not the pin'), hashlib.sha256(b'not the pin').hexdigest(),
+                              fetch.SELENE[4])
+with contextlib.redirect_stdout(io.StringIO()):
+    assert fetch.main(['--check', '--root', str(t)]) == 0
+
+# 7. The kernel loads the Asahi vendor firmware copy (usr/lib/firmware/vendor/
+# <name>) before ours (usr/lib/firmware/<name>). A vendor copy that matches the
+# pin is enough; one that does not shadows ours and is a problem. Without a
+# good vendor copy the tool still installs ours (the fetch is a stub here).
+# Every FETCH chip runs; --hook does the same on a DEFAULT_ON chip and fetches
+# nothing on the others. Both come from the tables at run time, so a promotion
+# flip (tools/promote_chip.py) changes nothing here.
+good, other = b'pinned bytes', b'other bytes'
+for chip, row in fetch.FETCH.items():
+    fetch.FETCH[chip] = (row[0], row[1], len(good), hashlib.sha256(good).hexdigest(), row[4])
+fetch.fetch_member = lambda url, member: der(0x30, der(0x16, b'IM4P') + der(0x16, b'anef') + der(0x16, b'1') +
+                                             der(0x04, good))
+bin_dir = Path(tempfile.mkdtemp())
+shutil.copy(root / 'packaging/omarchy-ane-check', bin_dir)
+(bin_dir / 'omarchy-ane-firmware-fetch').write_text(f'''#!/usr/bin/env python3
+import sys
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+sys.dont_write_bytecode = True
+spec = spec_from_loader('fetch', SourceFileLoader('fetch', {str(root / 'packaging/omarchy-ane-firmware-fetch')!r}))
+fetch = module_from_spec(spec)
+spec.loader.exec_module(fetch)
+fetch.FETCH = {fetch.FETCH!r}
+sys.exit(fetch.main())
+''')
+(bin_dir / 'omarchy-ane-firmware-fetch').chmod(0o755)
+SHADOW = 'The kernel loads this vendor copy before'
+
+
+def files(chip, name, vendor, ours):
+    t = system([chip.encode()], fetch.FETCH[chip][4].encode())
+    for sub, data in (('usr/lib/firmware/vendor', vendor), ('usr/lib/firmware', ours)):
+        if data is not None:
+            (t / sub / name).parent.mkdir(parents=True, exist_ok=True)
+            (t / sub / name).write_bytes(data)
+    return t
+
+
+def installed(t, name):
+    f = t / 'usr/lib/firmware' / name
+    return f.read_bytes() if f.exists() else None
+
+
+def call(*args):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = fetch.main(list(args))
+    return rc, out.getvalue() + err.getvalue()
+
+
+for chip, row in fetch.FETCH.items():
+    name = row[1]
+    # (vendor, ours) -> --check exit and line; install exit, line, and our file after
+    CASES = (
+        ('vendor only', good, None, 0, '(Asahi vendor firmware) matches the pin', 0, 'Nothing to fetch', None),
+        ('ours only', None, good, 0, f'firmware/{name} matches the pin', 0, 'already installed', good),
+        ('both', good, good, 0, '(Asahi vendor firmware) matches the pin', 0, 'Nothing to fetch', good),
+        ('wrong vendor, ours good', other, good, 1, SHADOW, 1, SHADOW, good),
+        ('wrong vendor, no ours', other, None, 1, SHADOW, 1, SHADOW, good),
+        ('neither', None, None, 1, 'is missing. Run: sudo omarchy-ane-firmware-fetch', 0, 'installed', good),
+    )
+    for case, vendor, ours, check_rc, check_line, run_rc, run_line, after in CASES:
+        case = (chip, case)
+        t = files(chip, name, vendor, ours)
+        rc, out = call('--check', '--root', str(t))
+        assert rc == check_rc and check_line in out, (case, out)
+        # omarchy-ane-check prints the firmware line for the ane_t6021 family only.
+        if chip.split(',')[1] not in ('t8132', 't6040', 't6041'):
+            p = subprocess.run([str(bin_dir / 'omarchy-ane-check'), '--root', str(t)], capture_output=True, text=True)
+            line = next(l for l in p.stdout.splitlines() if 'ANE firmware' in l or name in l)
+            assert line.startswith('  ok    ANE firmware: ' if check_rc == 0 else '  FAIL  ') and check_line in line, \
+                (case, line)
+        rc, out = call('--root', str(t))
+        assert rc == run_rc and run_line in out, (case, out)
+        assert installed(t, name) == after, case
+        t = files(chip, name, vendor, ours)
+        rc, out = call('--hook', '--root', str(t))
+        on = chip in fetch.DEFAULT_ON
+        assert rc == 0 and (run_line if on else 'the ANE is not on by default here. Nothing fetched.') in out, \
+            (case, out)
+        assert installed(t, name) == (after if on else ours), case
+
+# 7b. The kernel's firmware search path (firmware_class.path, first in the
+#     kernel's search order; NixOS points it at the Nix store) is checked
+#     before the vendor copy and our own. Empty or absent parameter: the old
+#     order. --check only; run() keeps installing to usr/lib/firmware.
+chip, name = 'apple,t6021', fetch.FETCH['apple,t6021'][1]
+def fw_system(loader_dir, loader_data, vendor=None, ours=None):
+    t = system([b'apple,j414c', b'apple,t6021'], b'13.5')
+    if loader_dir is not None:
+        p = t / 'sys/module/firmware_class/parameters/path'
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(loader_dir + '\n')
+    if loader_dir and loader_data is not None:
+        f = t / loader_dir.lstrip('/') / name
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_bytes(loader_data)
+    for sub, data in (('usr/lib/firmware/vendor', vendor), ('usr/lib/firmware', ours)):
+        if data is not None:
+            (t / sub / name).parent.mkdir(parents=True, exist_ok=True)
+            (t / sub / name).write_bytes(data)
+    return t
+
+for case, loader_dir, loader, vendor, ours, rc, line in (
+        ('no parameter file', None, None, good, good, 0, '(Asahi vendor firmware) matches the pin'),
+        ('empty parameter', '', None, good, good, 0, '(Asahi vendor firmware) matches the pin'),
+        ('loader matches', '/nix/store/fw', good, good, good, 0, f'/nix/store/fw/{name} (kernel firmware path) matches the pin'),
+        ('loader wrong, vendor good', '/nix/store/fw', other, good, good, 1, 'The kernel loads this copy first'),
+        ('loader missing, ours good', '/nix/store/fw', None, None, good, 0, f'firmware/{name} matches the pin')):
+    c, t = (chip, case), fw_system(loader_dir, loader, vendor, ours)
+    rc_, out = call('--check', '--root', str(t))
+    assert rc_ == rc and line in out, (c, out)
+
+
+# 8. RangeFile reads a 206 body only up to the range it asked for: a body
+# longer than the request is truncated, not slurped (offline: _get is faked).
+seen = []
+
+class fake_206:
+    def __init__(self, status, body):
+        self.status, self.body = status, body
+    def read(self, n=-1):
+        seen.append(n)
+        return self.body if n < 0 else self.body[:n]
+    def __enter__(self):
+        return self
+    def __exit__(self, *exc):
+        return False
+
+def range_file(status, body):
+    rf = fetch.RangeFile.__new__(fetch.RangeFile)
+    rf.url, rf.pos, rf.size = 'http://127.0.0.1:9/x', 0, 100
+    rf._get = lambda start, end: fake_206(status, body)
+    return rf
+
+rf = range_file(206, b'x' * 4096)  # a body far longer than the range
+seen.clear()
+assert rf.read(8) == b'x' * 8 and rf.pos == 8 and seen == [8], (seen, rf.pos)
+try:
+    range_file(206, b'short').read(8)
+    raise AssertionError('accepted a short 206 body')
+except OSError:
+    pass
+try:
+    range_file(200, b'x' * 8).read(8)
+    raise AssertionError('accepted a non-206 body')
+except OSError:
+    pass
+print('test_ane_firmware_fetch: ok')

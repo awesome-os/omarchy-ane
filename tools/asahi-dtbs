@@ -1,0 +1,48 @@
+#!/bin/bash
+# asahi-dtbs OUT [URL REF]: the linux-asahi 7.1.13 board device trees, or with
+# URL and REF those of that kernel tree at that tag or branch, for every PREFIX
+# in packaging/dt/overlays and every packaging/dt/PREFIX-ane-dataonly.dts, for
+# tools/test_ane_overlays.py. A PREFIX with no board device tree gets none.
+#
+# OUT/bin gets the kernel tree's dtc and fdtoverlay (dtc 1.7.2 with the Asahi
+# changes; libfdt linked in, so no older system libfdt.so can renumber
+# phandles). OUT/dtbs gets PREFIX-*.dtb, built with the cpp and dtc steps of
+# kbuild from AsahiLinux/linux tag $tag (below), the source of the Arch linux-asahi
+# package. Checked 2026-10-01: these steps build the 41 Apple M-series DTBs of
+# linux-asahi-7.1.13.asahi3-2 (usr/lib/modules/7.1.13-3-2-ARCH/dtbs) byte for byte.
+# Needs git, gcc, flex and bison. About 20 MB on disk, nothing installed.
+set -euo pipefail
+shopt -s nullglob
+url=https://github.com/AsahiLinux/linux tag=asahi-7.1.13-3
+(( $# == 1 || $# == 3 )) || { echo "usage: asahi-dtbs OUT [URL REF]" >&2; exit 2; }
+(( $# == 1 )) || url=$2 tag=$3
+out=$(realpath -m -- "$1")
+repo=$(dirname -- "$(realpath -- "$0")")/..
+src=$out/linux d=$out/linux/scripts/dtc
+mkdir -p "$out/bin" "$out/dtbs"
+if [[ ! -d $src/.git ]]; then
+  git -c advice.detachedHead=false clone -q --depth 1 --branch "$tag" --filter=blob:none --sparse \
+    "$url" "$src"
+  git -C "$src" sparse-checkout set --no-cone /arch/arm64/boot/dts/apple/ /include/dt-bindings/ /scripts/dtc/
+fi
+
+flex -o "$out/dtc-lexer.lex.c" "$d/dtc-lexer.l"
+bison -o "$out/dtc-parser.tab.c" --defines="$out/dtc-parser.tab.h" -t -l "$d/dtc-parser.y"
+cc=(gcc -O2 -I "$d" -I "$d/libfdt" -I "$out" -DNO_YAML)
+"${cc[@]}" -o "$out/bin/dtc" "$d"/{dtc,flattree,fstree,data,livetree,treesource,srcpos,checks,util}.c \
+  "$out/dtc-lexer.lex.c" "$out/dtc-parser.tab.c"
+"${cc[@]}" -o "$out/bin/fdtoverlay" "$d"/{fdtoverlay,util}.c \
+  "$d"/libfdt/fdt{,_ro,_wip,_sw,_rw,_strerror,_empty_tree,_addresses,_overlay}.c
+
+dts=$src/arch/arm64/boot/dts/apple inc=$src/scripts/dtc/include-prefixes
+prefixes=$({ awk '/^[^#]/ { print $1 }' "$repo/packaging/dt/overlays"
+             for f in "$repo"/packaging/dt/*-ane-dataonly.dts; do f=${f##*/}; echo "${f%-ane-dataonly.dts}"; done; } | sort -u)
+for prefix in $prefixes; do
+  for f in "$dts/$prefix"-*.dts; do
+    b=$(basename "$f" .dts)
+    gcc -E -nostdinc -I "$inc" -undef -D__DTS__ -x assembler-with-cpp -o "$out/$b.dts.tmp" "$f"
+    "$out/bin/dtc" -q -O dtb -o "$out/dtbs/$b.dtb" -b 0 -i "$dts" -i "$inc" "$out/$b.dts.tmp"
+    rm "$out/$b.dts.tmp"
+  done
+done
+echo "asahi-dtbs: $(ls "$out/dtbs" | wc -l) DTBs in $out/dtbs; tools in $out/bin ($("$out/bin/dtc" --version))"

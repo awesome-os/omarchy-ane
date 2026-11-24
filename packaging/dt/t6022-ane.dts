@@ -1,0 +1,41 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Overlay state: opt-in ("ane-t6022" in /etc/omarchy-mac-boot/dtb-overlays.opt-in).
+ * ANE for T6022 (M2 Ultra) board device trees: the die-0 ANE only. Die 0 has
+ * the T6021 values
+ * (t602x-ane.dtsi, same in the macOS 13.5 ADTs of j180d and j475d), and the
+ * 13.5 BuildManifest gives ANE0 the same firmware (t602x_ane0_fw_selene_rc4x).
+ * ane_t6021 binds apple,t6022-ane and runs that firmware from memory it
+ * allocates, with iBoot's runtime patches replayed (ane/t6021/ane_fw_validate.h),
+ * so no preload address and no reserved-memory node is needed. RTK_soc is
+ * 0x6022, the chip revision 0x11 (ANEMinorVersion 17 on community row
+ * 90c6b9bf3e03), and the ASC tunables are the T6021 values: the macOS 26.6.2
+ * iBoot of j180d and j475d holds the same ANE table as j414c
+ * (receipts/2026-10-01-t8112-optin).
+ *
+ * The die-1 ANE (ADT ane1: 0x2284000000, interrupt 884 on die 1, DARTs at
+ * 0x2285800000, firmware t602x_ane1_fw_selene_rc4x) is left out: ane_t6021
+ * drives one ANE, and its T6022 data (ane_t6022_soc in
+ * ane/t6021/ane_t6021_fwload.c: the pmgr page 0x28e084000) is die 0's.
+ */
+/dts-v1/;
+/plugin/;
+
+/ {
+	/* dtb-overlays.sh: a kernel tree that has the node keeps its own. */
+	omarchy,skip-if-compatible = "apple,t6022-ane";
+	/* dtb-overlays.sh: applies only when opted in. */
+	omarchy,opt-in = "ane-t6022";
+};
+
+/include/ "t602x-ane.dtsi"
+
+/ {
+	fragment@10 {
+		__overlay__ {
+			ane@284000000 {
+				compatible = "apple,t6022-ane";
+			};
+		};
+	};
+};

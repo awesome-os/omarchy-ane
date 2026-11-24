@@ -1,0 +1,1404 @@
+/* SPDX-License-Identifier: GPL-2.0-only OR MIT
+ *
+ * Offline regression for the W15 boot contract units
+ * (ane/t6021/ane_t6021_boot.h) — userspace twin of the kernel
+ * consumers (ane_t6021_boot.c sequencer + the pending publication
+ * increment). Shipped in this repository so the tested unit and its
+ * check travel together.
+ *
+ * Build:
+ *   gcc -Wall -Wextra -O2 -I ane/t6021 \
+ *       -o h14_boot_regression tools/h14_boot_regression.c
+ * Exit 0 = every positive and negative case behaved as asserted.
+ *
+ * Capture mode: h14_boot_regression SELENE.macho BYTES-DIR...
+ * also replays iBoot's runtime patches (ane_fw_validate.h) on the
+ * archive and requires byte equality with each pre-Linux capture
+ * BYTES-DIR/{text,data}-segment.bin (guard taken from the capture).
+ * T8112: h14_boot_regression --bia BIA.macho validates the bia archive
+ * and replays the T8112 patches on it.
+ *
+ * Byte anchors: KC 8304156f… (ANE_Init 0x95e9850–0x95e9988 RVBAR fold,
+ * 0x95ea710–0x95ea97c init suballocation), selene 9f7915c4…; receipts
+ * 2026-09-20-h14-rvbar-width / -legacy-init-publication /
+ * mapper-callchain-audit (commits 3762aee, 12be074, 04630ef, c364f24).
+ */
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+typedef uint8_t u8;
+typedef uint32_t u32;
+typedef uint64_t u64;
+
+#include "ane_t6021_boot.h"
+
+static int failures;
+static int checks;
+
+static void check(int cond, const char *name, const char *detail)
+{
+	checks++;
+	if (cond) {
+		printf("PASS %-44s (%s)\n", name, detail);
+	} else {
+		failures++;
+		printf("FAIL %-44s (%s)\n", name, detail);
+	}
+}
+
+static u64 rd_le64(const u8 *p)
+{
+	u64 v = 0;
+	int i;
+
+	for (i = 7; i >= 0; i--)
+		v = (v << 8) | p[i];
+	return v;
+}
+
+static u32 rd_le32(const u8 *p)
+{
+	return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) |
+	       ((u32)p[3] << 24);
+}
+
+#define get_unaligned_le32(p) rd_le32(p)
+#define get_unaligned_le64(p) rd_le64(p)
+#include "ane_fw_validate.h"
+
+#define FW_IMG_SIZE	ANE_FW_BUF_SIZE
+#define FW_DATA_VM	0xc4000
+
+/* __rtk_patch records (vm, tag, value length) and the type-1 tunables
+ * block of each 13.5 archive, read independently of the header: selene
+ * from the 17 T6021 preload captures, bia from its LC_SYMTAB
+ * (receipts/2026-10-01-t8112-ane). */
+struct arch_rec { u32 vm, tag, len; };
+static const struct arch_rec selene_rec[ANE_FW_RTK_PATCHES] = {
+	{ 0xca848, 0x53544b47, 8 }, { 0xca9b3, 0x534f435f, 4 },
+	{ 0xca9bf, 0x534f4352, 4 }, { 0xca9cb, 0x43704164, 8 },
+	{ 0xca9db, 0x57724164, 8 },
+};
+static const struct arch_rec bia_rec[ANE_FW_RTK_PATCHES] = {
+	{ 0xba688, 0x53544b47, 8 }, { 0xba7f3, 0x534f435f, 4 },
+	{ 0xba7ff, 0x534f4352, 4 }, { 0xba80b, 0x43704164, 8 },
+	{ 0xba81b, 0x57724164, 8 },
+};
+#define SELENE_TUN_VM	0xdcd78
+#define BIA_TUN_VM	0xccbb8
+#define BIA_DATA_VM	0xb4000
+
+static const struct ane_fw_boot_patch t6021_patch = {
+	.exec_base = 0x10000000000ULL, .stack_guard = 0x4476ff001c97e931ULL,
+	.soc = 0x6021, .soc_revision = 0x11,
+	.cpu_pa = 0x285000000ULL, .wrapper_pa = 0x285400000ULL,
+};
+
+/* The tunables block of the 17 T6021 captures, byte for byte. */
+static const u8 t6021_capture_tunables[0x1e8] = {
+	0x01, 0x03, 0x24, 0x18, 0x10, 0x00, 0x00, 0x00,
+	0x10, 0x00, 0x15, 0x00, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x08, 0x1c, 0x05, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00,
+	0x18, 0x1c, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00,
+	0x20, 0x00, 0x14, 0x00, 0x00, 0x00, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x20, 0x01, 0x14, 0x00, 0xff, 0x2e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xb1, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x30, 0x01, 0x14, 0x00, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x38, 0x01, 0x14, 0x00, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x40, 0x01, 0x14, 0x00, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x48, 0x01, 0x14, 0x00, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x50, 0x01, 0x14, 0x00, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x58, 0x01, 0x14, 0x00, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4e, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x60, 0x01, 0x14, 0x00, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x68, 0x01, 0x14, 0x00, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4e, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x70, 0x01, 0x14, 0x00, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x78, 0x01, 0x14, 0x00, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x80, 0x01, 0x14, 0x00, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x88, 0x01, 0x14, 0x00, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x90, 0x01, 0x14, 0x00, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x98, 0x01, 0x14, 0x00, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0xa0, 0x01, 0x14, 0x00, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0xa8, 0x01, 0x14, 0x00, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4e, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x10, 0x50, 0x14, 0x00, 0x0c, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x08, 0xa0, 0x14, 0x00, 0xff, 0xff, 0xf0, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x20, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x10, 0xa0, 0x14, 0x00, 0xff, 0xff, 0xf0, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x20, 0x25, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+};
+
+/* iBootStage2 macOS 26.6.2 (25G83) ANE (coprocessor 4) tables as iBoot
+ * stores them ({u32 offset | flag bit 30, u64 mask, u64 value}): j413
+ * 0x1a09ac (T8112, 23 records) and j414s 0x1c9758 (T6020, 24 records),
+ * receipts/2026-10-01-t8112-optin. */
+static const u8 j413_iboot_ane[460] = {
+	0x08, 0x1c, 0x05, 0x40, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00,
+	0x18, 0x1c, 0x05, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00,
+	0x20, 0x00, 0x14, 0x40, 0x00, 0x00, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x78, 0x00, 0x00, 0x00, 0x00, 0x40,
+	0x20, 0x01, 0x14, 0x40, 0xff, 0x2e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xb1, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x30, 0x01, 0x14, 0x40, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x38, 0x01, 0x14, 0x40, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x40, 0x01, 0x14, 0x40, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x48, 0x01, 0x14, 0x40, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x50, 0x01, 0x14, 0x40, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x58, 0x01, 0x14, 0x40, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x86, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x60, 0x01, 0x14, 0x40, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x68, 0x01, 0x14, 0x40, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x70, 0x01, 0x14, 0x40, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x78, 0x01, 0x14, 0x40, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x43, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x80, 0x01, 0x14, 0x40, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x88, 0x01, 0x14, 0x40, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x43, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x90, 0x01, 0x14, 0x40, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x98, 0x01, 0x14, 0x40, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0xa0, 0x01, 0x14, 0x40, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0xa8, 0x01, 0x14, 0x40, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x10, 0x50, 0x14, 0x40, 0x0c, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x08, 0xa0, 0x14, 0x40, 0xff, 0xff, 0xf0, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x20, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x10, 0xa0, 0x14, 0x40, 0xff, 0xff, 0xf0, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x20, 0x25, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00,
+};
+
+static const u8 j414s_iboot_ane[480] = {
+	0x10, 0x00, 0x15, 0x40, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x08, 0x1c, 0x05, 0x40, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00,
+	0x18, 0x1c, 0x05, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00,
+	0x20, 0x00, 0x14, 0x40, 0x00, 0x00, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x20, 0x01, 0x14, 0x40, 0xff, 0x2e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xb1, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x30, 0x01, 0x14, 0x40, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x38, 0x01, 0x14, 0x40, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x40, 0x01, 0x14, 0x40, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x48, 0x01, 0x14, 0x40, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x50, 0x01, 0x14, 0x40, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x58, 0x01, 0x14, 0x40, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x86, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x60, 0x01, 0x14, 0x40, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x68, 0x01, 0x14, 0x40, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4e, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x70, 0x01, 0x14, 0x40, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x78, 0x01, 0x14, 0x40, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x80, 0x01, 0x14, 0x40, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x88, 0x01, 0x14, 0x40, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x90, 0x01, 0x14, 0x40, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x98, 0x01, 0x14, 0x40, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0xa0, 0x01, 0x14, 0x40, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0xa8, 0x01, 0x14, 0x40, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x10, 0x50, 0x14, 0x40, 0x0c, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x08, 0xa0, 0x14, 0x40, 0xff, 0xff, 0xf0, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x20, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x10, 0xa0, 0x14, 0x40, 0xff, 0xff, 0xf0, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x20, 0x25, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+};
+
+/* Archive state of every patched field; zero elsewhere. */
+static u8 *unpatched_image(const struct arch_rec *rec, u32 tun_vm)
+{
+	u8 *img = calloc(1, FW_IMG_SIZE);
+	unsigned int i;
+
+	for (i = 0; i < ANE_FW_RTK_PATCHES; i++) {
+		ane_fw_put_le(img + rec[i].vm, rec[i].tag, 4);
+		ane_fw_put_le(img + rec[i].vm + 4, rec[i].len, 4);
+		ane_fw_put_le(img + rec[i].vm + 8, ~0ULL, rec[i].len);
+	}
+	memcpy(img + tun_vm, "\x01\x03\x24\x00\xff\xff\xff\xff", 8);
+	memcpy(img + tun_vm + 0x2d8, "\x03\x03\x24\x00\xff\xff\xff\xff", 8);
+	return img;
+}
+
+/* The expected image: the archive with every field iBoot writes, the
+ * tunables block built from an iBoot table (flag bit 30 dropped). */
+static u8 *patched_image(const struct arch_rec *rec, u32 tun_vm, u32 data_vm,
+			 const struct ane_fw_boot_patch *p, u32 key,
+			 const u8 *iboot, unsigned int n)
+{
+	u8 *img = unpatched_image(rec, tun_vm);
+	const u64 vals[ANE_FW_RTK_PATCHES] = { p->stack_guard, p->soc,
+		p->soc_revision, p->cpu_pa, p->wrapper_pa };
+	unsigned int i;
+
+	ane_fw_put_le(img + 0x423c, p->exec_base + data_vm, 8);
+	for (i = 0; i < ANE_FW_RTK_PATCHES; i++)
+		ane_fw_put_le(img + rec[i].vm + 8, vals[i], rec[i].len);
+	img[tun_vm + 3] = n;
+	ane_fw_put_le(img + tun_vm + 4, key, 4);
+	for (i = 0; i < n * 20; i++)
+		img[tun_vm + 8 + i] = iboot[i];
+	for (i = 0; i < n; i++)
+		img[tun_vm + 8 + 20 * i + 3] &= ~0x40;
+	return img;
+}
+
+static u8 *read_file(const char *path, size_t want)
+{
+	FILE *f = fopen(path, "rb");
+	u8 *buf = malloc(want + 1);
+	size_t got = f ? fread(buf, 1, want + 1, f) : 0;
+
+	if (f)
+		fclose(f);
+	if (got != want) {
+		free(buf);
+		return NULL;
+	}
+	return buf;
+}
+
+/* RTK_soc_revision from the two T8112 eFuse words, the instructions of
+ * iBootStage2 25G83 j413 0x40270 step by step: ubfx w0, w9, #27, #3;
+ * extr w8, w8, w9, #30; bfi w0, w8, #4, #3. */
+static u32 iboot_t8112_rev(u32 w9, u32 w8)
+{
+	u32 w0 = (w9 >> 27) & 7;
+	u32 x = (u32)((((u64)w8 << 32) | w9) >> 30);
+
+	return (w0 & ~0x70u) | ((x & 7) << 4);
+}
+
+static void boot_patch_checks(void)
+{
+	u8 *img = unpatched_image(selene_rec, SELENE_TUN_VM);
+	u8 *want = unpatched_image(selene_rec, SELENE_TUN_VM), *pre;
+	struct ane_fw_boot_patch p = t6021_patch;
+	const char *reason = NULL;
+	unsigned int i, diff;
+	u64 vals[ANE_FW_RTK_PATCHES] = { p.stack_guard, p.soc, p.soc_revision,
+					 p.cpu_pa, p.wrapper_pa };
+	static const u32 fuse[][2] = {
+		{ 0x00000000, 0x00000000 }, { 0x08000000, 0x00000000 },
+		{ 0x80000000, 0x00000000 }, { 0x88000000, 0x00000000 },
+		{ 0x40000000, 0x00000001 }, { 0xf8000000, 0xffffffff },
+		{ 0x37ffffff, 0xfffffffe }, { 0x12345678, 0x9abcdef1 },
+	};
+
+	ane_fw_put_le(want + 0x423c, 0x100000c4000ULL, 8);
+	for (i = 0; i < ANE_FW_RTK_PATCHES; i++)
+		ane_fw_put_le(want + selene_rec[i].vm + 8, vals[i], selene_rec[i].len);
+	memcpy(want + SELENE_TUN_VM, t6021_capture_tunables, sizeof(t6021_capture_tunables));
+
+	check(ane_fw_apply_boot_patches(img, &ane_fw_selene, &ane_t602x_asc_tunables,
+					&p, &reason) == 0 &&
+	      !memcmp(img, want, FW_IMG_SIZE),
+	      "boot patches: T6021 preload fields",
+	      "DATA base 0x100000c4000, soc, rev, ASC PAs, guard, tunables; no other byte");
+
+	pre = malloc(FW_IMG_SIZE);
+	memcpy(pre, img, FW_IMG_SIZE);
+	check(ane_fw_apply_boot_patches(img, &ane_fw_selene, &ane_t602x_asc_tunables,
+					&p, &reason) != 0 && reason &&
+	      !memcmp(img, pre, FW_IMG_SIZE),
+	      "boot patches: second replay refused", "DATA base already set; image untouched");
+	free(pre);
+	free(img);
+
+	img = unpatched_image(selene_rec, SELENE_TUN_VM);
+	img[0xca9cb] ^= 1;
+	pre = malloc(FW_IMG_SIZE);
+	memcpy(pre, img, FW_IMG_SIZE);
+	reason = NULL;
+	check(ane_fw_apply_boot_patches(img, &ane_fw_selene, &ane_t602x_asc_tunables,
+					&p, &reason) != 0 && reason &&
+	      !memcmp(img, pre, FW_IMG_SIZE),
+	      "boot patches: record tag drift refused", "RTK_cpu tag; nothing written");
+	img[0xca9cb] ^= 1;
+	img[0xca9c3] = 8;
+	memcpy(pre, img, FW_IMG_SIZE);
+	check(ane_fw_apply_boot_patches(img, &ane_fw_selene, &ane_t602x_asc_tunables,
+					&p, &reason) != 0 &&
+	      !memcmp(img, pre, FW_IMG_SIZE),
+	      "boot patches: record length drift refused", "RTK_soc_revision len 8; nothing written");
+	img[0xca9c3] = 4;
+	img[0xdcd7b] = 0x18;
+	memcpy(pre, img, FW_IMG_SIZE);
+	check(ane_fw_apply_boot_patches(img, &ane_fw_selene, &ane_t602x_asc_tunables,
+					&p, &reason) != 0 &&
+	      !memcmp(img, pre, FW_IMG_SIZE),
+	      "boot patches: filled tunables refused", "header != archive; nothing written");
+	img[0xdcd7b] = 0;
+	{
+		struct ane_asc_tunables only_b0 = ane_t602x_asc_tunables;
+
+		only_b0.keys[0] = 0x10;
+		only_b0.nkeys = 1;
+		p.soc_revision = 0x01;
+		memcpy(pre, img, FW_IMG_SIZE);
+		check(ane_fw_apply_boot_patches(img, &ane_fw_selene, &only_b0, &p,
+						&reason) != 0 &&
+		      !memcmp(img, pre, FW_IMG_SIZE),
+		      "boot patches: no key <= revision refused",
+		      "rev 0x01, keys {0x10}; nothing written");
+		p.soc_revision = 0x11;
+	}
+	free(pre);
+	free(img);
+
+	img = unpatched_image(selene_rec, SELENE_TUN_VM);
+	p.exec_base = 0x3ffff800000ULL;
+	check(ane_fw_apply_boot_patches(img, &ane_fw_selene, &ane_t602x_asc_tunables,
+					&p, &reason) == 0 &&
+	      rd_le64(img + 0x423c) == 0x3ffff8c4000ULL,
+	      "boot patches: unlatched DATA base", "staged DVA + DATA vmaddr");
+	free(img);
+	free(want);
+
+	/* T6020 (rev 0x01 -> key 0x00): the j414s table. */
+	p = t6021_patch;
+	p.soc = 0x6020;
+	p.soc_revision = 0x01;
+	img = unpatched_image(selene_rec, SELENE_TUN_VM);
+	want = patched_image(selene_rec, SELENE_TUN_VM, FW_DATA_VM, &p, 0x00,
+			     j414s_iboot_ane, 24);
+	check(ane_fw_apply_boot_patches(img, &ane_fw_selene, &ane_t6020_asc_tunables,
+					&p, &reason) == 0 &&
+	      !memcmp(img, want, FW_IMG_SIZE),
+	      "boot patches: T6020", "j414s iBoot table, key 0x00, rev 0x01; no other byte");
+	for (i = diff = 0; i < 24; i++)
+		diff += ane_t6020_asc_tunables.r[i].val != ane_t602x_asc_tunables.r[i].val;
+	check(diff == 13, "T6020 vs T6021 tunables", "13 of 24 values differ");
+	free(img);
+	free(want);
+
+	/* T8112 on the bia layout, each revision key. */
+	p = t6021_patch;
+	p.exec_base = 0x800000000ULL;
+	p.soc = 0x8112;
+	p.cpu_pa = 0x26b000000ULL;
+	p.wrapper_pa = 0x26b400000ULL;
+	{
+		static const u32 rev[][2] = {
+			{ 0x00, 0x00 }, { 0x01, 0x00 }, { 0x10, 0x10 }, { 0x11, 0x10 },
+			{ 0x21, 0x10 },
+		};
+
+		for (i = 0; i < sizeof(rev) / sizeof(rev[0]); i++) {
+			char name[64];
+
+			p.soc_revision = rev[i][0];
+			img = unpatched_image(bia_rec, BIA_TUN_VM);
+			want = patched_image(bia_rec, BIA_TUN_VM, BIA_DATA_VM, &p, rev[i][1],
+					     j413_iboot_ane, 23);
+			snprintf(name, sizeof(name), "boot patches: T8112 rev %#x -> key %#x",
+				 rev[i][0], rev[i][1]);
+			check(ane_fw_apply_boot_patches(img, &ane_fw_bia,
+							&ane_t8112_asc_tunables, &p,
+							&reason) == 0 &&
+			      !memcmp(img, want, FW_IMG_SIZE), name,
+			      "j413 iBoot table, DATA base 0x8000b4000; no other byte");
+			free(img);
+			free(want);
+		}
+	}
+
+	for (i = 0; i < sizeof(fuse) / sizeof(fuse[0]); i++) {
+		char name[64];
+
+		snprintf(name, sizeof(name), "T8112 fuse %08x %08x", fuse[i][0], fuse[i][1]);
+		check(ane_t8112_fuse_revision(fuse[i][0], fuse[i][1]) ==
+		      iboot_t8112_rev(fuse[i][0], fuse[i][1]), name,
+		      "decode = iBoot j413 0x40270");
+	}
+}
+
+/* Validate the archive and replay on it. */
+static u8 *staged_archive(const char *macho, const struct ane_fw_image *fw)
+{
+	u8 *blob = read_file(macho, fw->size), *img;
+	struct ane_fw_seg segs[ANE_FW_NSEGS];
+	const char *reason = NULL;
+	u64 entry;
+	unsigned int i;
+
+	/* sha256sum is checked outside: pass the pin as the digest */
+	check(blob && !ane_fw_validate_blob(blob, fw->size, fw, fw->sha256,
+					    segs, &entry, &reason),
+	      "archive layout", macho);
+	if (!blob)
+		return NULL;
+	img = calloc(1, FW_IMG_SIZE);
+	for (i = 0; i < ANE_FW_NSEGS; i++)
+		memcpy(img + segs[i].vmaddr, blob + segs[i].fileoff, segs[i].filesize);
+	free(blob);
+	return img;
+}
+
+/* T8112: the real bia archive takes every patch, and the type-3 block
+ * stays as the archive has it. */
+static void bia_checks(const char *macho)
+{
+	u8 *img = staged_archive(macho, &ane_fw_bia);
+	struct ane_fw_boot_patch p = { .exec_base = 0x800000000ULL,
+		.stack_guard = 0x1122330055667788ULL, .soc = 0x8112,
+		.soc_revision = 0x10, .cpu_pa = 0x26b000000ULL,
+		.wrapper_pa = 0x26b400000ULL };
+	const char *reason = NULL;
+
+	if (!img)
+		return;
+	check(ane_fw_apply_boot_patches(img, &ane_fw_bia, &ane_t8112_asc_tunables,
+					&p, &reason) == 0 &&
+	      !memcmp(img + BIA_TUN_VM, "\x01\x03\x24\x17\x10\x00\x00\x00", 8) &&
+	      !memcmp(img + BIA_TUN_VM + 0x2d8, "\x03\x03\x24\x00\xff\xff\xff\xff", 8) &&
+	      rd_le64(img + 0x423c) == 0x8000b4000ULL,
+	      "bia archive: boot patches", reason ? reason : "type-1 block 23 records, key 0x10");
+	free(img);
+}
+
+/* Replay on the real selene archive, compared with real captures. */
+static void capture_checks(const char *macho, char **dirs, int n)
+{
+	u8 *arch = staged_archive(macho, &ane_fw_selene);
+	const char *reason = NULL;
+	char path[4096], detail[160];
+	int d;
+
+	if (!arch)
+		return;
+	for (d = 0; d < n; d++) {
+		u8 *img = malloc(FW_IMG_SIZE), *text, *data;
+		struct ane_fw_boot_patch p = t6021_patch;
+		size_t i, raw = 0, diff = 0, len = 0x4fc000;
+
+		memcpy(img, arch, FW_IMG_SIZE);
+		snprintf(path, sizeof(path), "%s/text-segment.bin", dirs[d]);
+		text = read_file(path, FW_DATA_VM);
+		snprintf(path, sizeof(path), "%s/data-segment.bin", dirs[d]);
+		data = read_file(path, len - FW_DATA_VM);
+		if (!text || !data) {
+			check(0, "capture mode: read", dirs[d]);
+			free(img); free(text); free(data);
+			continue;
+		}
+		for (i = 0; i < len; i++)
+			raw += img[i] != (i < FW_DATA_VM ? text[i] : data[i - FW_DATA_VM]);
+		p.stack_guard = rd_le64(data + 0xca850 - FW_DATA_VM);
+		if (ane_fw_apply_boot_patches(img, &ane_fw_selene, &ane_t602x_asc_tunables,
+					      &p, &reason))
+			diff = len;
+		for (i = 0; i < len && diff != len; i++)
+			diff += img[i] != (i < FW_DATA_VM ? text[i] : data[i - FW_DATA_VM]);
+		snprintf(detail, sizeof(detail), "%zu bytes differ unpatched, %zu after replay",
+			 raw, diff);
+		check(diff == 0, dirs[d], detail);
+		free(img); free(text); free(data);
+	}
+	free(arch);
+}
+
+
+/* ---- fake MMIO backend (test-only; the kernel wraps real io in
+ * ane_t6021_boot.c at gate-flip time) ---- */
+struct fake {
+	unsigned int woff[64];
+	u32 wval[64];
+	int nwr;
+	int nw64;
+	u64 w64val;
+	int prepare_at;
+	int cpuctrl0_at;
+	int wake_at;
+	int barrier_at;
+	u64 rvbar;
+	u32 s7[4];
+	int n7;
+	u32 scratch0_val;
+	u32 scratch1_val;
+	int polls;
+	int s7_never_ack;
+	int failed;
+	int fail_alloc_idx;   /* fail the Nth allocation (-1 = none) */
+	const char *phase[16];
+	int nphase;
+	u32 prep_lo;
+	u32 prep_hi;
+	u32 scratch3_req;
+	u32 scratch1_captured;
+	u64 asz[8];
+	u64 aiov[8];
+	int nasz;
+};
+
+/* file-scope sources for the shared assembly (nonzero prev_fw_len on
+ * purpose: catches low-byte-only serialization) */
+static const struct ane_t6021_init_sources asm_src = {
+	.fw_dva = 0x0000deadbeef000ULL,
+	.ipc_dva = 0,   /* ZERO input: [0x08] must come from the
+			 * ALLOCATOR output (Main zero-DVA bug) */
+	.cfg_size = 0x500000,
+	.prev_fw_len = 0x1234,
+	.heap_floor = 0x30000ULL,
+	.pool_dma = 0,  /* ZERO input: [0x58] must come from the
+			 * ALLOCATOR output */
+	.pool_word0 = 0x40000, /* pool total length: HYPOTHESIS-GRADE in
+				* shipped sources; here it exercises the
+				* fill's u64 copy — the SHIPPED value
+				* stays hard-gated */
+};
+
+static struct fake *fake;
+static u8 fake_mem[0x80000];
+static size_t fake_mem_off;
+
+static void *f_alloc2(void *ctx, u64 size, u64 *iova)
+{
+	struct fake *f = fake;
+	void *p;
+
+	(void)ctx;
+	if (f->nasz == f->fail_alloc_idx || f->nasz >= 8) {
+		*iova = 0;
+		return NULL;
+	}
+	p = fake_mem + fake_mem_off;
+	/* call-order iovas: pool, 'IPC ', HEAP — matching the golden */
+	switch (f->nasz) {
+	case 0: *iova = 0x5555aaaab000ULL; break;
+	case 1: *iova = 0x00000badc0de000ULL; break;
+	case 2: *iova = 0x0000feedface000ULL; break;
+	default: *iova = 0x10000000ULL * (u64)(f->nasz + 1); break;
+	}
+	f->asz[f->nasz] = size;
+	f->aiov[f->nasz] = *iova;
+	f->nasz++;
+	fake_mem_off = (fake_mem_off + size + 0xfffULL) & ~(size_t)0xfffULL;
+	return p;
+}
+
+static struct fake *fake;
+
+static void fake_reset(struct fake *f)
+{
+	memset(f, 0, sizeof(*f));
+	fake_mem_off = 0;
+	f->nw64 = -1;
+	f->prepare_at = -1;
+	f->cpuctrl0_at = -1;
+	f->wake_at = -1;
+	f->barrier_at = -1;
+	f->fail_alloc_idx = -1;
+}
+
+static u32 f_rd32(void *ctx, unsigned int off)
+{
+	struct fake *f = ctx ? ctx : fake;
+
+	if (off == ANE_T6021_BOOT_REG_SCRATCH0)
+		return f->scratch0_val;
+	if (off == ANE_T6021_BOOT_REG_SCRATCH1)
+		return f->scratch1_val;
+	if (off == ANE_T6021_BOOT_REG_SCRATCH7) {
+		if (f->s7_never_ack)
+			return 0;
+		if (f->n7 < (int)(sizeof(f->s7) / sizeof(f->s7[0])))
+			return f->s7[f->n7++];
+		return ANE_T6021_BOOT_ACK;
+	}
+	return 0;
+}
+
+static u64 f_rd64(void *ctx, unsigned int off)
+{
+	struct fake *f = ctx ? ctx : fake;
+	(void)off;
+	return f->rvbar;
+}
+
+static void f_rec(struct fake *f, unsigned int off, u32 v)
+{
+	if (f->nwr < (int)(sizeof(f->woff) / sizeof(f->woff[0]))) {
+		f->woff[f->nwr] = off;
+		f->wval[f->nwr] = v;
+	}
+	f->nwr++;
+}
+
+static void f_wr32(void *ctx, unsigned int off, u32 v)
+{
+	struct fake *f = fake;
+
+	(void)ctx;
+
+	if (off == ANE_T6021_BOOT_REG_CPUCTRL && v == 0)
+		f->cpuctrl0_at = f->nwr;
+	if (off == ANE_T6021_BOOT_REG_SCRATCH7 && v == ANE_T6021_BOOT_WAKE_REQ)
+		f->wake_at = f->nwr;
+	f_rec(f, off, v);
+}
+
+static void f_wr64(void *ctx, unsigned int off, u64 v)
+{
+	struct fake *f = fake;
+
+	(void)ctx;
+
+	(void)off;
+	f->nw64 = f->nwr;
+	f->w64val = v;
+	f_rec(f, off, (u32)v);
+}
+
+static void f_dsb(void *ctx)
+{
+	struct fake *f = fake;
+
+	(void)ctx;
+	f->barrier_at = f->nwr;
+}
+
+static void f_wait(void *ctx)
+{
+	struct fake *f = fake;
+
+	(void)ctx;
+	f->polls++;
+}
+
+static void f_phase(void *ctx, const char *what)
+{
+	struct fake *f = fake;
+
+	(void)ctx;
+	if (f->nphase < (int)(sizeof(f->phase) / sizeof(f->phase[0])))
+		f->phase[f->nphase++] = what;
+}
+
+static int f_prepare(void *ctx, u32 *lo, u32 *hi)
+{
+	struct fake *f = fake;
+	struct ane_t6021_boot_allocs a;
+	int err;
+
+	(void)ctx;
+	f->prepare_at = f->nwr;
+	/* THE SHARED ASSEMBLY — same function the kernel prepare calls:
+	 * wrong-DVA, double-increment and unbounded-size classes must
+	 * fail here, not on hardware. */
+	err = ane_t6021_boot_prepare_publish(&asm_src, f->scratch3_req,
+					     f->scratch0_val,
+					     f->scratch1_captured, 0x4000,
+					     ANE_T6021_BOOT_IPC_CEILING,
+					     ANE_T6021_BOOT_HEAP_CEILING,
+					     NULL, f_alloc2, &a, lo, hi);
+	if (err)
+		return err;
+	return 0;
+}
+
+int main(int argc, char **argv)
+{
+	/* ---- RVBAR entry fold (ANE_Init 0x95e9868-0x95e988c algebra:
+	 * ENTRY_BASE | (iova & ADDR_MASK); mask clears bits 0-10, 48,
+	 * 55 and RETAINS bit 11; base supplies bit0 + fixed upper
+	 * pattern). Vectors computed independently of the header
+	 * implementation. ---- */
+	check(ane_t6021_rvbar_compose(0) == 0x0081000000000001ULL,
+	      "compose(0)", "pure valid bit, entry 0");
+	check(ane_t6021_rvbar_compose(0x1000) == 0x0081000000001001ULL,
+	      "compose(0x1000)", "aligned pass-through");
+	check(ane_t6021_rvbar_compose(0x500000) == 0x0081000000500001ULL,
+	      "compose(0x500000)", "FWIM surface size (config+0x138)");
+	check(ane_t6021_rvbar_compose(0x123456789ULL) ==
+	      0x0081000123456001ULL,
+	      "compose(0x123456789)", "bits 0-10 dropped");
+	check(ane_t6021_rvbar_compose(0xdeadbeef000ULL) ==
+	      0x00810deadbeef001ULL,
+	      "compose(0xdeadbeef000)", "mid-range DVA");
+	check(ane_t6021_rvbar_compose(0x7f123456789ULL) ==
+	      0x008107f123456001ULL,
+	      "compose(0x7f123456789)", "39-bit DVA");
+	check(ane_t6021_rvbar_compose(0x0001800000001000ULL) ==
+	      0x0081800000001001ULL,
+	      "compose bit48+55 cleared, bit47 survives",
+	      "byte(48-55)=0x01 masked by 0x7e; byte(40-47)=0x80 kept");
+	check(ane_t6021_rvbar_compose(0x0100800000001000ULL) ==
+	      0x0181800000001001ULL,
+	      "compose bit47+56 survive",
+	      "bit47 in byte5 and bit56 in byte7 are outside the clears");
+
+	/* ---- Latch/entry decode (tbnz w0,#0 skip, ANE_Init
+	 * 0x95e9878; live W8/W10 reads 0x1). ---- */
+	check(ane_t6021_rvbar_latched(0x1), "latched(W8/W10 live 0x1)",
+	      "bit0 set");
+	check(ane_t6021_rvbar_latched(0) == false, "latched(0)",
+	      "bit0 clear = unprogrammed");
+	check(ane_t6021_rvbar_latched(0x0081000000001001),
+	      "latched(post-write readback)", "fold sets bit0");
+	check(ane_t6021_rvbar_entry_bits(0x1) == 0,
+	      "entry_bits(live 0x1) == 0", "entry field zero");
+	check(ane_t6021_rvbar_entry_bits(0x00810deadbeef001) ==
+	      0xdeadbeef000,
+	      "entry_bits round-trip", "entry recoverable from a read");
+	check(ane_t6021_rvbar_entry_bits(0x0081000123456001) ==
+	      0x123456000,
+	      "entry_bits low-bit truncation", "matches the fold algebra");
+
+	/* ---- Acceptance predicate — the EXACT check the boot path
+	 * applies (ane_t6021_rvbar_entry_ok): accept clean iovas and
+	 * bit-11 iovas (retained), reject any iova carrying a dropped
+	 * bit (0-10, 48, 55). ---- */
+	{
+		static const struct {
+			u64 iova;
+			bool ok;
+			const char *why;
+		} rt[] = {
+			{ 0xdeadbeef000ULL, true, "clean DVA accepted" },
+			{ 0x800ULL, true, "bit 11 RETAINED — accepted" },
+			{ 0x400ULL, false, "bit 10 rejected" },
+			{ 0x200ULL, false, "bit 9 rejected" },
+			{ 0x7ffULL, false, "entire low mask 0-10 rejected" },
+			{ 0x0001000000000000ULL, false,
+			  "bit 48 rejected" },
+			{ 0x0080000000000000ULL, false,
+			  "bit 55 rejected" },
+			{ 0x0080000000001800ULL, false,
+			  "bit 55 rejected even with retained bits 11+12" },
+		};
+		unsigned int i;
+
+		for (i = 0; i < sizeof(rt) / sizeof(rt[0]); i++) {
+			u64 got = ane_t6021_rvbar_entry_bits(
+				ane_t6021_rvbar_compose(rt[i].iova));
+
+			check(ane_t6021_rvbar_entry_ok(rt[i].iova) ==
+			      rt[i].ok, "entry acceptance", rt[i].why);
+			/* the fold agrees with the predicate: accepted
+			 * iovas round-trip exactly, rejected ones lose
+			 * bits */
+			check(got == (rt[i].iova &
+				      ANE_T6021_RVBAR_ADDR_MASK),
+			      "fold algebra", rt[i].why);
+		}
+	}
+
+	/* ---- SCRATCH0/1 u64 split (publication convention: low32 ->
+	 * SCRATCH0 0x01840048 first, high32 -> SCRATCH1 0x0184004c,
+	 * dsb st before; legacy-init-publication receipt). ---- */
+	{
+		u32 lo = 0, hi = 0;
+
+		ane_t6021_scratch64_split(0x123456789abcdef0ULL, &lo, &hi);
+		check(lo == 0x9abcdef0U && hi == 0x12345678U,
+		      "split low/high halves", "lo first convention");
+		check(ane_t6021_scratch64_join(lo, hi) ==
+		      0x123456789abcdef0ULL,
+		      "join(split(v)) == v", "u64 reassembly");
+		check(ane_t6021_scratch64_join(0xffffffffU, 0) ==
+		      0x00000000ffffffffULL,
+		      "join zero-extends hi", "no sign extension");
+	}
+
+	/* ---- Init suballocation SOURCED fill (pass6 cd25b46, anchors
+	 * G1-G26): static sources + post-READY dynamic heap/ordinal.
+	 * TRUST BOUNDARY: scratch3_req is firmware-supplied and must pass
+	 * ane_t6021_heap_size bounds before allocation. Pool word0
+	 * semantics still open (selene lane) — the source is pinned, never
+	 * a synthesized zero. ---- */
+	{
+		static const struct ane_t6021_init_sources src = {
+			.fw_dva = 0x0000deadbeef000ULL,
+			.ipc_dva = 0x00000badc0de000ULL,
+			.cfg_size = 0x500000,
+			.prev_fw_len = 0x1234, /* nonzero: full u32 must land at [0x30] */
+			.heap_floor = 0x30000ULL,
+			.pool_dma = 0x5555aaaab000ULL,
+			.pool_word0 = 0x40000, /* MECHANISM-ONLY test value: the shipped [0x60] stays HARD-GATED (pf_pool_word0_proven) until pool+0x00 producer/consumer proof lands */
+		};
+		const u64 heap_size = ane_t6021_heap_size(0x8000, 0x30000,
+							  0x300000000ULL);
+		const u64 heap_dva = 0x0000feedface000ULL;
+		const u32 ordinal = 7;
+		u8 buf[ANE_T6021_INIT_STRUCT_SIZE];
+		u8 leak[ANE_T6021_INIT_STRUCT_SIZE];
+		static const u8 golden[ANE_T6021_INIT_STRUCT_SIZE] = {
+		0x00, 0xf0, 0xee, 0xdb, 0xea, 0x0d, 0x00, 0x00, 0x00, 0xe0, 0x0d, 0xdc, 0xba, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xb0, 0x0f, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0xe0, 0xac, 0xdf, 0xee, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x34, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xb0, 0xaa, 0xaa, 0x55, 0x55, 0x00, 0x00,
+		0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+		};
+		size_t i;
+		int touched;
+
+		check(ANE_T6021_INIT_COUNT_OFF + 4 +
+			      ANE_T6021_INIT_TEMPLATE_SIZE == 0x16c,
+		      "template end 0x16c", "0x68+4+0x100");
+		check(0x16c + 8 == ANE_T6021_INIT_STRUCT_SIZE,
+		      "struct size 0x174", "0x16c + header qword");
+
+		/* trust boundary: 0 request -> no heap; below floor -> floor;
+		 * over ceiling -> refused */
+		/* 'IPC ' size: max(DART page 0x4000, ordinal+1) */
+		check(ane_t6021_ipc_size(0x4000, 0) == 0x4000,
+		      "ipc size: first boot = one 16K DART page",
+		      "max(0x4000, ordinal+1)");
+		check(ane_t6021_ipc_size(0x4000, 7) == 0x4000,
+		      "ipc size: ordinal below page size", "0x4000 wins");
+		check(ane_t6021_ipc_size(0x4000, 0x5000) == 0x5001,
+		      "ipc size: huge ordinal+1 dominates",
+		      "ordinal+1 wins over page size");
+		check(ane_t6021_heap_size(0, 0x30000,
+					  ANE_T6021_BOOT_HEAP_CEILING) == 0,
+		      "heap: request 0 -> no heap surface",
+		      "pass6: 0 if request 0");
+		check(ane_t6021_heap_size(0x8000, 0x30000,
+					  ANE_T6021_BOOT_HEAP_CEILING) == 0x30000,
+		      "heap: floor dominates small request",
+		      "MAX(request, floor)");
+		check(ane_t6021_heap_size(0x40000, 0x30000,
+					  ANE_T6021_BOOT_HEAP_CEILING) == 0x40000,
+		      "heap: request above floor passes",
+		      "MAX(request, floor)");
+		check(ane_t6021_heap_size(0x03000000, 0x30000,
+					  ANE_T6021_BOOT_HEAP_CEILING) == -E2BIG,
+		      "heap: request over the 32 MiB budget refused",
+		      "operational budget, distinct from ABI width");
+		check(ane_t6021_heap_size((u32)0x20000000ULL, 0x30000,
+					  0x10000000ULL) == -E2BIG,
+		      "heap: request over a tighter ceiling REFUSED",
+		      "trust boundary before allocation");
+
+		memset(buf, 0, sizeof(buf));
+		ane_t6021_init_struct_fill(buf, &src, (long long)heap_size,
+					   heap_dva, ordinal);
+		check(memcmp(buf, golden, sizeof(buf)) == 0,
+		      "sourced fill exact image",
+		      "every fw-read field from pinned + runtime sources");
+
+		check(rd_le64(buf) == src.fw_dva &&
+		      rd_le64(buf + 0x08) == src.ipc_dva &&
+		      rd_le64(buf + 0x10) == 0x500000ULL &&
+		      rd_le64(buf + 0x18) == 0x0fb00000ULL &&
+		      rd_le64(buf + 0x20) == heap_dva &&
+		      rd_le64(buf + 0x28) == heap_size &&
+		      rd_le32(buf + 0x30) == 0x1234 &&
+		      rd_le64(buf + 0x50) == ordinal &&
+		      rd_le64(buf + 0x58) == src.pool_dma &&
+		      rd_le64(buf + 0x60) == 0x40000ULL &&
+		      rd_le32(buf + ANE_T6021_INIT_COUNT_OFF) == 0x40 &&
+		      rd_le32(buf + ANE_T6021_INIT_TEMPLATE_OFF +
+			      ANE_T6021_INIT_TBIT_OFF) == 0x4,
+		      "fill field reads",
+		      "static + dynamic fields all decoded");
+
+		/* untouched-zone check: gaps [0x34..37]/[0x64..67] and the
+		 * kext-zero region [0x38..0x50) stay caller-owned */
+		memset(leak, 0xa5, sizeof(leak));
+		ane_t6021_init_struct_fill(leak, &src, 0x30000,
+					   0x1234, 9);
+		touched = 0;
+		for (i = 0; i < sizeof(leak); i++) {
+			int closed = i < 0x34 ||
+				     (i >= 0x50 && i < 0x70) ||
+				     i == (ANE_T6021_INIT_TEMPLATE_OFF +
+					   ANE_T6021_INIT_TBIT_OFF);
+
+			if (!closed && leak[i] != 0xa5)
+				touched++;
+		}
+		check(touched == 0, "fill touches sourced fields only",
+		      "gaps preserved byte-exact (zero the block first)");
+	}
+
+	/* ---- Fake-MMIO trace check: ane_t6021_boot_run against the
+	 * recording backend. Asserts (1) ZERO writes while the preflight
+	 * gate is closed, (2) exact write order/values on the bit0-set
+	 * skip branch, (3) the fold write on the unprogrammed branch,
+	 * (4) publish strictly after poll A, wake strictly after
+	 * publish, (5) poll A timeout = hold + DMA not reclaimable. ---- */
+	{
+		struct fake fk;
+		static const struct ane_t6021_boot_io io = {
+			.rd32 = f_rd32, .rd64 = f_rd64,
+			.wr32 = f_wr32, .wr64 = f_wr64,
+			.publish_barrier = f_dsb, .poll_wait = f_wait,
+			.phase = f_phase,
+			.prepare = f_prepare,
+		};
+
+		/* (1) gates closed -> -ENODATA and NOT ONE write */
+		fake_reset(&fk);
+		fake = &fk;
+		{
+			int cs = 0, fa = 0, bo = 0;
+			u64 sres = 0;
+			struct ane_t6021_boot_cfg cfg = {
+				.preflight_ok = 0,
+				.fw_dva = 0x500000,
+			};
+
+			check(ane_t6021_boot_run(&io, &cfg, &cs, &fa,
+						 &bo, &sres) == -ENODATA,
+			      "run: closed gate returns -ENODATA",
+			      "no sequence started");
+			check(fk.nwr == 0, "run: closed gate = no writes",
+			      "Main: all gates before any boot write");
+			check(cs == 0 && fa == 0 && bo == 0,
+			      "run: closed gate sets no flags",
+			      "state stays fenced");
+		}
+
+		/* (1b) live-fault gate OFF (2026-09-20 wedge): the whole
+		 * sequence is skipped with -EAGAIN and ZERO writes —
+		 * accidental-repeat prevention, before any write. */
+		fake_reset(&fk);
+		fk.rvbar = 0x1;
+		{
+			int cs = 0, fa = 0, bo = 0;
+			u64 sres = 0;
+			struct ane_t6021_boot_cfg cfg = {
+				.preflight_ok = 1,
+				.preboot_table_mode = 0,
+				.fw_dva = 0x0000deadbeef000ULL,
+			};
+
+			check(ane_t6021_boot_run(&io, &cfg, &cs, &fa,
+						 &bo, &sres) == -EAGAIN,
+			      "run: table gate OFF = -EAGAIN",
+			      "live-fault gate, zero writes");
+			check(fk.nwr == 0 && cs == 0 && fa == 0 && bo == 0,
+			      "gate-off: zero writes, no flags",
+			      "accidental-repeat prevention");
+		}
+
+		/* (2) open gate, bit0-set RVBAR (live state), mode 2: TABLE
+		 * SKIPPED (diagnostic) — grant tunables + full sequence. */
+		fake_reset(&fk);
+		fk.rvbar = 0x1;
+		fk.scratch0_val = 0x05;      /* below 0x21 band */
+		fk.scratch1_val = 0xab;
+		fk.scratch3_req = 0x8000;    /* below floor */
+		fk.scratch1_captured = 6;    /* ordinal 7 */
+		{
+			int cs = 0, fa = 0, bo = 0;
+			u64 sres = 0;
+			struct ane_t6021_boot_cfg cfg = {
+				.preflight_ok = 1,
+				.preboot_table_mode = 2,
+				.fw_dva = 0x0000deadbeef000ULL,
+			};
+			int r = ane_t6021_boot_run(&io, &cfg, &cs, &fa,
+						   &bo, &sres);
+
+			check(r == 0, "run: happy path returns 0",
+			      "fresh READY and DONE both observed");
+			check(cs == 1 && fa == 1 && bo == 1,
+			      "run: cpu_started/fw_alive/booted set",
+			      "full sequence");
+			check(fk.nwr == 28,
+			      "run: 28 writes (12 grant + 8 clear + s6 + pulse2 + cpu2 + pub2 + wake; NO table)",
+			      "mode-2 skip: full sequence minus table");
+			check(fk.woff[0] == 0x000 && fk.wval[0] == 0x10U &&
+			      fk.woff[11] == 0x430 &&
+			      fk.wval[11] == 0x00001100U,
+			      "grant tunables first (12 writes)",
+			      "W8 APERTURE_UNLOCKED replay");
+			check(fk.woff[12] == ANE_T6021_BOOT_REG_SCRATCH0 &&
+			      fk.wval[12] == 0 &&
+			      fk.woff[19] ==
+			      ANE_T6021_BOOT_REG_SCRATCH7 &&
+			      fk.wval[19] == 0,
+			      "all eight scratch cells cleared",
+			      "exact init clears ALL, not only 7");
+			check(fk.woff[20] ==
+			      ANE_T6021_BOOT_REG_SCRATCH6 &&
+			      fk.wval[20] == 1 &&
+			      fk.woff[21] ==
+			      ANE_T6021_BOOT_REG_SCRATCH7 &&
+			      fk.wval[21] == 1 &&
+			      fk.woff[22] ==
+			      ANE_T6021_BOOT_REG_SCRATCH7 &&
+			      fk.wval[22] == 0,
+			      "SCRATCH6=1 then SCRATCH7 pulse 1->0",
+			      "stale ack cleared pre-CPU");
+			check(fk.nw64 < 0,
+			      "no RVBAR write on bit0-set branch",
+			      "lawful skip; never write over bit0");
+			check(fk.cpuctrl0_at == 23 &&
+			      fk.wval[23] == 0 &&
+			      fk.wval[24] == ANE_T6021_CPU_RUN_RELEASE,
+			      "CPU_CONTROL 0 then 0x10 after pulse",
+			      "strict order, both paths");
+			check(fk.prepare_at == 25 &&
+			      fk.barrier_at == 25,
+			      "prepare+dsb after poll A",
+			      "publication strictly post-alive");
+			check(fk.woff[25] ==
+			      ANE_T6021_BOOT_REG_SCRATCH0 &&
+			      fk.wval[25] == (u32)(0x5555aaaab000ULL & 0xffffffffU) &&
+			      fk.woff[26] ==
+			      ANE_T6021_BOOT_REG_SCRATCH1 &&
+			      fk.wval[26] == (u32)(0x5555aaaab000ULL >> 32),
+			      "publish low32/high32 from prepare",
+			      "suballoc DVA halves");
+			check(fk.woff[27] ==
+			      ANE_T6021_BOOT_REG_SCRATCH7 &&
+			      fk.wval[27] == ANE_T6021_BOOT_WAKE_REQ,
+			      "wake after publish", "releases fw wait");
+			check(fk.nasz == 3 &&
+			      fk.asz[0] == 0x40000 &&
+			      fk.asz[1] == 0x4000 &&
+			      fk.asz[2] == 0x30000,
+			      "SHARED assembly alloc sizes",
+			      "pool 0x40000; ipc max(0x4000,6+1); heap max(req,floor)");
+			check(fk.aiov[2] == 0x0000feedface000ULL,
+			      "SHARED assembly heap DVA",
+			      "fill sees the ALLOCATED iova (no NULL publish)");
+			check(rd_le64(fake_mem + 0x58) == fk.aiov[0],
+			      "publish header [0x58] = ALLOCATED pool DVA",
+			      "not the zeroed input source (Main zero-DVA bug)");
+			check(sres == 0x000000ab00000005ULL,
+			      "DONE result captured raw (SC1<<32|SC0)",
+			      "exposed, not discarded (Main review)");
+		}
+
+		/* (2b) IPC double-increment catch: captured 0x3FFF makes
+		 * the correct ordinal+1 exactly one DART page (0x4000);
+		 * a +2 bug would allocate 0x4001. */
+		fake_reset(&fk);
+		fk.rvbar = 0x1;
+		fk.scratch1_captured = 0x3fff;
+		{
+			int cs = 0, fa = 0, bo = 0;
+			u64 sres = 0;
+			struct ane_t6021_boot_cfg cfg = {
+				.preflight_ok = 1,
+				.preboot_table_mode = 2,
+				.fw_dva = 0x0000deadbeef000ULL,
+			};
+
+			check(ane_t6021_boot_run(&io, &cfg, &cs, &fa,
+						 &bo, &sres) == 0,
+			      "run: 0x3FFF captured boots",
+			      "ordinal boundary");
+			check(fk.asz[1] == 0x4000,
+			      "IPC size = ordinal+1 EXACT (no double add)",
+			      "max(0x4000, 0x3FFF+1) == 0x4000");
+		}
+
+		/* (2c) SCRATCH0 band boundary: 0x20 accepted (below
+		 * threshold), 0x21 REFUSED before ANY allocation. */
+		fake_reset(&fk);
+		fk.rvbar = 0x1;
+		fk.scratch0_val = 0x20;
+		fk.scratch1_val = 6;
+		fk.scratch3_req = 0x8000;
+		{
+			int cs = 0, fa = 0, bo = 0;
+			u64 sres = 0;
+			struct ane_t6021_boot_cfg cfg = {
+				.preflight_ok = 1,
+				.preboot_table_mode = 2,
+				.fw_dva = 0x0000deadbeef000ULL,
+			};
+
+			check(ane_t6021_boot_run(&io, &cfg, &cs, &fa,
+						 &bo, &sres) == 0,
+			      "run: scratch0=32 accepted",
+			      "boundary below threshold");
+			check(fk.nasz == 3,
+			      "scratch0=32 allocates pool/ipc/heap",
+			      "MAX path taken");
+		}
+		fake_reset(&fk);
+		fk.rvbar = 0x1;
+		fk.scratch0_val = 0x21;
+		fk.scratch1_val = 6;
+		{
+			int cs = 0, fa = 0, bo = 0;
+			u64 sres = 0;
+			struct ane_t6021_boot_cfg cfg = {
+				.preflight_ok = 1,
+				.preboot_table_mode = 2,
+				.fw_dva = 0x0000deadbeef000ULL,
+			};
+
+			check(ane_t6021_boot_run(&io, &cfg, &cs, &fa,
+						 &bo, &sres) == -EPROTO,
+			      "run: scratch0=33 REFUSED (-EPROTO)",
+			      "Main raw trace 0x95ea2a0->0x3330");
+			check(cs == 1 && fk.nasz == 0,
+			      "refusal BEFORE allocations/publication",
+			      "post-READY refusal; wedged-pin holds");
+			check(ane_t6021_boot_dma_reclaimable(cs) == false,
+			      "refusal: DMA held (wedged-pin)",
+			      "reboot reclaims");
+		}
+
+		/* (3) bit0-clear RVBAR: the fold write64 appears */
+		fake_reset(&fk);
+		{
+			int cs = 0, fa = 0, bo = 0;
+			u64 sres = 0;
+			struct ane_t6021_boot_cfg cfg = {
+				.preflight_ok = 1,
+				.preboot_table_mode = 2,
+				.fw_dva = 0x0000deadbeef000ULL,
+			};
+
+			check(ane_t6021_boot_run(&io, &cfg, &cs, &fa,
+						 &bo, &sres) == 0,
+			      "run: unprogrammed branch boots",
+			      "direct-image fold path");
+			/* DONE result capture: the fake returns scratch1
+			 * read = 0 -> hi word 0; scratch0 read = 0 -> lo 0.
+			 * Nonzero capture is asserted in case (2). */
+			check(sres == 0, "DONE result captured",
+			      "raw u64 exposed, not discarded");
+			check(fk.nw64 == 23 &&
+			      fk.w64val ==
+			      ane_t6021_rvbar_compose(cfg.fw_dva),
+			      "RVBAR write64 = entry fold",
+			      "after grant+scratch pulse, before CPU release");
+		}
+
+		/* (4) poll A timeout: HOLD — started, nothing published */
+		fake_reset(&fk);
+		fk.s7_never_ack = 1;
+		{
+			int cs = 0, fa = 0, bo = 0;
+			u64 sres = 0;
+			struct ane_t6021_boot_cfg cfg = {
+				.preflight_ok = 1,
+				.preboot_table_mode = 2,
+				.fw_dva = 0x0000deadbeef000ULL,
+			};
+
+			check(ane_t6021_boot_run(&io, &cfg, &cs, &fa,
+						 &bo, &sres) == -ETIMEDOUT,
+			      "run: poll A timeout = -ETIMEDOUT",
+			      "bounded polls");
+			check(cs == 1 && fa == 0 && bo == 0,
+			      "timeout: cpu_started, not alive/booted",
+			      "HOLD semantics");
+			check(fk.prepare_at < 0 && fk.nasz == 0,
+			      "timeout: no publish, NO allocations",
+			      "no partial boot past poll A");
+			check(fk.nwr == 26,
+			      "timeout: writes stop after CPU release (26 = 25 + fold wr64)",
+			      "no publish/wake after poll A timeout");
+			check(ane_t6021_boot_dma_reclaimable(cs) == false,
+			      "ownership: DMA NOT reclaimable while started",
+			      "cannot free while the CPU may fetch");
+		}
+
+		/* (5) fw-start-debug stop_after bisect (2026-09-22):
+		 * stop AFTER step N returns -ECANCELED, never splits a
+		 * step, and a poll-A timeout inside step 4 stays
+		 * -ETIMEDOUT. Bit0-set branch throughout: no fold write. */
+		fake_reset(&fk);
+		fk.rvbar = 0x1;
+		{
+			int cs = 0, fa = 0, bo = 0;
+			u64 sres = 0;
+			struct ane_t6021_boot_cfg cfg = {
+				.preflight_ok = 1,
+				.preboot_table_mode = 2,
+				.fw_dva = 0x0000deadbeef000ULL,
+				.stop_after = 1,
+			};
+
+			check(ane_t6021_boot_run(&io, &cfg, &cs, &fa,
+						 &bo, &sres) == -ECANCELED,
+			      "stop_after=1 returns -ECANCELED",
+			      "tunables done, nothing else fired");
+			check(fk.nwr == 12 && cs == 0 && fa == 0 && bo == 0,
+			      "stop_after=1 = exactly the 12 tunables",
+			      "no CPU, no scratch");
+			check(fk.woff[0] == 0x000 && fk.woff[11] == 0x430,
+			      "stop_after=1 order intact",
+			      "first 0x000, last 0x430");
+		}
+		fake_reset(&fk);
+		fk.rvbar = 0x1;
+		{
+			int cs = 0, fa = 0, bo = 0;
+			u64 sres = 0;
+			struct ane_t6021_boot_cfg cfg = {
+				.preflight_ok = 1,
+				.preboot_table_mode = 2,
+				.fw_dva = 0x0000deadbeef000ULL,
+				.stop_after = 2,
+			};
+
+			check(ane_t6021_boot_run(&io, &cfg, &cs, &fa,
+						 &bo, &sres) == -ECANCELED,
+			      "stop_after=2 returns -ECANCELED",
+			      "scratch clear+pulse done");
+			check(fk.nwr == 23 &&
+			      fk.wval[22] == 0 &&
+			      fk.woff[22] == ANE_T6021_BOOT_REG_SCRATCH7,
+			      "stop_after=2 ends on the pulse (23 writes)",
+			      "12 + 8 clear + s6 + pulse2; CPU untouched");
+		}
+		fake_reset(&fk);
+		fk.rvbar = 0x1;
+		{
+			int cs = 0, fa = 0, bo = 0;
+			u64 sres = 0;
+			struct ane_t6021_boot_cfg cfg = {
+				.preflight_ok = 1,
+				.preboot_table_mode = 2,
+				.fw_dva = 0x0000deadbeef000ULL,
+				.stop_after = 3,
+			};
+
+			check(ane_t6021_boot_run(&io, &cfg, &cs, &fa,
+						 &bo, &sres) == -ECANCELED,
+			      "stop_after=3 returns -ECANCELED",
+			      "rvbar decision recorded (skip branch)");
+			check(fk.nwr == 23 && fk.nw64 < 0,
+			      "stop_after=3 adds no write on bit0-set",
+			      "decision is the read; RUN never fired");
+		}
+		fake_reset(&fk);
+		fk.rvbar = 0x1;
+		{
+			int cs = 0, fa = 0, bo = 0;
+			u64 sres = 0;
+			struct ane_t6021_boot_cfg cfg = {
+				.preflight_ok = 1,
+				.preboot_table_mode = 2,
+				.fw_dva = 0x0000deadbeef000ULL,
+				.stop_after = 4,
+			};
+
+			check(ane_t6021_boot_run(&io, &cfg, &cs, &fa,
+						 &bo, &sres) == -ECANCELED,
+			      "stop_after=4 READY returns -ECANCELED",
+			      "fw alive, publish/wake withheld");
+			check(cs == 1 && fa == 1 && bo == 0,
+			      "stop_after=4: started+alive, not booted",
+			      "wedged-pin semantics apply");
+			check(fk.nwr == 25 && fk.prepare_at < 0 &&
+			      fk.nasz == 0,
+			      "stop_after=4 = 25 writes, NO publish/alloc",
+			      "23 + CPU_CONTROL 0 + 0x10");
+			check(ane_t6021_boot_dma_reclaimable(cs) == false,
+			      "stop_after=4: DMA held",
+			      "CPU may be fetching");
+		}
+		fake_reset(&fk);
+		fk.rvbar = 0x1;
+		fk.s7_never_ack = 1;
+		{
+			int cs = 0, fa = 0, bo = 0;
+			u64 sres = 0;
+			struct ane_t6021_boot_cfg cfg = {
+				.preflight_ok = 1,
+				.preboot_table_mode = 2,
+				.fw_dva = 0x0000deadbeef000ULL,
+				.stop_after = 4,
+			};
+
+			check(ane_t6021_boot_run(&io, &cfg, &cs, &fa,
+						 &bo, &sres) == -ETIMEDOUT,
+			      "stop_after=4 timeout stays -ETIMEDOUT",
+			      "the timeout is the answer, not the stop");
+			check(cs == 1 && fk.nwr == 25,
+			      "timeout writes = same 25",
+			      "stop_after cannot silence a timeout");
+		}
+		check(ane_t6021_boot_dma_reclaimable(0) == true,
+		      "ownership: DMA reclaimable when never started",
+		      "normal status-only removal");
+		check(ane_t6021_boot_remove_held(1) == true &&
+		      ane_t6021_boot_remove_held(0) == false,
+		      "remove-held predicate",
+		      "whole lifetime held while started (H13 wedge)");
+		fake = NULL;
+	}
+
+	{
+		struct ane_t6021_chman_desc t[8] = {
+			{ "TERMINAL", 2, 0, 0x300, 0xff7a0800, {0} },
+			{ "IO", 0, 1, 0x10, 0xff7ac800, {0} },
+			{ "DEBUG", 0, 2, 8, 0xff7acc00, {0} },
+			{ "BUF_H2T", 0, 3, 0x40, 0xff7ace00, {0} },
+			{ "BUF_T2H", 1, 4, 0x40, 0xff7ade00, {0} },
+			{ "SHAREDMALLOC", 1, 5, 8, 0xff7aee00, {0} },
+			{ "IO_T2H", 1, 6, 0x40, 0xff7af000, {0} },
+			{ "DATA_CHAIN_H2T", 0, 7, 0x10, 0xff7b0000, {0} },
+		};
+		const u64 ipc = 0xff7a0000;
+
+		check(ane_t6021_chman_check(t, ipc) == 0,
+		      "13.5 live firmware channel table", "captured before ACK");
+		{
+			u8 *surface = malloc(0x10440);
+			u8 *expected = malloc(0x10440);
+			unsigned int channel, slot;
+
+			if (!surface || !expected)
+				return 1;
+			memset(surface, 0xa4, 0x10440);
+			memcpy(surface, t, sizeof(t));
+			memcpy(expected, surface, 0x10440);
+			check(!ane_t6021_chman_host_init(surface, 0x1043f, ipc) &&
+			      !memcmp(surface, expected, 0x10440),
+			      "short IPC rejected without writes", "full channel extent required");
+			((struct ane_t6021_chman_desc *)surface)[7].ring = ~(u64)0;
+			memcpy(expected, surface, 0x10440);
+			check(!ane_t6021_chman_host_init(surface, 0x10440, ipc) &&
+			      !memcmp(surface, expected, 0x10440),
+			      "invalid last ring rejected atomically", "no earlier ring changed");
+			memcpy(surface, t, sizeof(t));
+			memcpy(expected, surface, 0x10440);
+			for (channel = 0; channel < 8; channel++) {
+				if (t[channel].type != 0)
+					continue;
+				for (slot = 0; slot < t[channel].size; slot++) {
+					u8 *entry = expected + t[channel].ring - ipc + slot * 64;
+
+					memset(entry, 0, 24);
+					entry[0] = 1;
+				}
+			}
+			check(ane_t6021_chman_host_init(surface, 0x10440, ipc) &&
+			      !memcmp(surface, expected, 0x10440),
+			      "all H2T slots initially host-owned",
+			      "firmware cannot consume zero commands; other bytes unchanged");
+			check(!ane_t6021_chman_host_init(surface, 0x10440, ~(u64)0) &&
+			      !memcmp(surface, expected, 0x10440),
+			      "DVA overflow rejected without writes", "no wrapped ring address");
+			free(expected);
+			free(surface);
+		}
+		t[1].bit = 9;
+		check(ane_t6021_chman_check(t, ipc) == (1U << 1),
+		      "chman IO doorbell bit drift", "mask names entry 1");
+		t[1].bit = 1;
+		t[6].ring = ipc + 0xb040;
+		check(ane_t6021_chman_check(t, ipc) == (1U << 6),
+		      "chman IO_T2H ring base drift", "mask names entry 6");
+		t[6].ring = ipc + 0xf000;
+		check(ane_t6021_chman_check(t, ipc + 0x40) != 0,
+		      "chman rings based elsewhere", "IPC DVA is the base");
+		memset(t, 0, sizeof(t));
+		check(ane_t6021_chman_check(t, ipc) == 0xff,
+		      "chman zero table", "no fw table = every entry bad");
+	}
+
+	boot_patch_checks();
+	if (argc == 3 && !strcmp(argv[1], "--bia"))
+		bia_checks(argv[2]);
+	else if (argc > 2)
+		capture_checks(argv[1], argv + 2, argc - 2);
+
+	printf("%s: %d checks, %d failures\n",
+	       failures ? "FAILED" : "PASSED", checks, failures);
+	return failures != 0;
+}

@@ -1,0 +1,453 @@
+#!/usr/bin/env python3
+"""omarchy-ane-dt: put the ANE device tree node in m1n1's device trees.
+
+ane.ko binds only to an "apple,t*-ane" device tree node. Until the kernel's
+device trees carry one, the package ships overlays that add it:
+/OVERLAY_DIR/PREFIX/NAME.dtbo (OVERLAY_DIR is set below). PREFIX selects board
+device trees by file name ("t8103" for every t8103-*.dtb). The T6021 prefix
+also has an opt-in overlay that is not an ANE part: omarchy-uboot-serial-stdin,
+U-Boot console input from serial only.
+
+  omarchy-ane-dt apply    overlay this Mac's board device tree, for every
+                          installed kernel, and have update-m1n1 use the copy
+  omarchy-ane-dt remove   undo apply
+  omarchy-ane-dt status   say where the running device tree's ANE node is from,
+                          and print dtbs_source=kernel|overlay|unknown
+
+apply never changes a file a package owns and never runs update-m1n1. It
+writes the overlaid copy to /var/lib/omarchy-ane/dtbs/KERNEL/ and adds one line
+to /etc/default/update-m1n1 that sources /usr/lib/omarchy-ane/update-m1n1-dtbs.
+That script swaps the copy in only while it was made from the same kernel file.
+An overlay whose root has the string list "omarchy,skip-if-compatible" is left
+out of a kernel device tree that already has an enabled node (no status, "okay"
+or "ok") with one of them: the kernel's node wins. A disabled node does not
+count: the overlay applies, and its nodes of the same name replace the kernel
+node's properties and enable it. When no overlay is left, apply retires the copy.
+An overlay whose root has the string "omarchy,opt-in" applies only when that
+string is a line of /etc/omarchy-mac-boot/dtb-overlays.opt-in, which the owner
+writes (the untested T6002, T6022 and T8112 nodes: "ane-t6002", "ane-t6022" and "ane-t8112"; the T6021 U-Boot input: "uboot-serial-stdin-t6021").
+An overlay whose root has "omarchy,data-only" carries SoC data for a chip that
+no driver binds: apply never applies it, whatever the opt-in file says. status
+adds "data-only (no driver): SOC" when SOC_DIR/SOC.json, the package's copy of
+data/ane-soc/SOC.json, says data-only.
+With omarchy-mac-boot, the overlays are its business: newer omarchy-mac-boot
+applies them itself, and older omarchy-mac-boot refuses changed device trees.
+A non-empty DTBS= line in /etc/default/update-m1n1 (dtbs_source=kernel) makes
+m1n1 boot the device trees it names: update-m1n1-dtbs and omarchy-mac-boot's
+overlays both step aside, so no overlay or opt-in reaches m1n1 and apply
+refuses. Empty or unset DTBS is dtbs_source=overlay; no file is unknown.
+
+--root DIR reads and writes below DIR (tests). --hook is for the pacman hook:
+what it cannot do here is a note, not an error. Needs dtc (dtc, fdtoverlay,
+fdtget). Exit 0: done or nothing to do. Exit 1: refused or failed; the stock
+device trees are in place.
+"""
+import argparse
+import glob
+import hashlib
+import json
+import os
+import re
+import struct
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+# Where the package installs its overlays: the directory omarchy-mac-boot
+# ships for package-owned overlays and its dtb-overlays.sh applies (omacom/
+# omarchy-mac-pkgs#3, the port of omacom/omarchy-mac#677). packaging/build-dtbo
+# reads this line, and 90-omarchy-ane-dt.hook's second Target names the same
+# directory (tools/test_ane_dt.py checks both). Arch
+# Linux ARM installs have no omarchy-mac-boot, so there apply,
+# update-m1n1-dtbs and the hooks stay.
+OVERLAY_DIR = "usr/lib/omarchy-mac-boot/dtb-overlays"
+# The directories before 2026-10-04: usr/lib/omarchy-platform (until
+# 2026-10-01) and usr/share/omarchy-platform (the omacom/omarchy-mac#677
+# location). apply refuses while either has overlays, so a hand install there
+# (the lab M2) keeps its copies until it moves them. Remove with its check in
+# apply when no install uses them.
+OLD_OVERLAY_DIRS = ("usr/lib/omarchy-platform/dtb-overlays",
+                    "usr/share/omarchy-platform/dtb-overlays")
+FRAGMENT = "/usr/lib/omarchy-ane/update-m1n1-dtbs"
+LINE = f"[ -r {FRAGMENT} ] && . {FRAGMENT}  # omarchy-ane"
+ANE = re.compile(r"apple,t[0-9a-z]+-ane")
+OPT_IN = "etc/omarchy-mac-boot/dtb-overlays.opt-in"
+CONFIG = "etc/default/update-m1n1"
+DTBS = re.compile(r"\s*(?:export\s+)?DTBS=(.*)")
+# The community collector's field (omarchy-mlx scripts/collect_deep.py), also
+# printed by status and omarchy-ane-check.
+DTBS_SOURCE = "dtbs_source"
+KERNEL_DT = "overlay opt-in has no effect, chip enabled only by its node in the kernel DT"
+# The per-SoC data files (data/ane-soc/*.json); packaging/build-dtbo reads
+# this line.
+SOC_DIR = "usr/share/omarchy-ane/soc"
+REFS = {"power-domains": "#power-domain-cells", "iommus": "#iommu-cells",
+        "mboxes": "#mbox-cells", "resets": "#reset-cells"}
+
+
+class Refuse(Exception):
+    pass
+
+
+class Tree:
+    """A flattened device tree: {path: {property: bytes}}."""
+
+    def __init__(self, blob):
+        magic, total, off_struct, off_strings = struct.unpack_from(">IIII", blob)
+        if magic != 0xD00DFEED or total > len(blob):
+            raise Refuse("not a flattened device tree")
+        self.nodes, stack, pos = {}, [], off_struct
+        while True:
+            token, = struct.unpack_from(">I", blob, pos)
+            pos += 4
+            if token == 1:
+                end = blob.index(b"\0", pos)
+                name = blob[pos:end].decode()
+                pos = (end + 4) & ~3
+                stack.append(name)
+                self.nodes["/" + "/".join(stack[1:])] = {}
+            elif token == 2:
+                stack.pop()
+            elif token == 3:
+                size, nameoff = struct.unpack_from(">II", blob, pos)
+                pos += 8
+                end = blob.index(b"\0", off_strings + nameoff)
+                prop = blob[off_strings + nameoff:end].decode()
+                self.nodes["/" + "/".join(stack[1:])][prop] = blob[pos:pos + size]
+                pos = (pos + size + 3) & ~3
+            elif token == 4:
+                continue
+            elif token == 9:
+                break
+            else:
+                raise Refuse(f"bad device tree token {token}")
+        self.phandles = {cells(p["phandle"])[0]: path for path, p in self.nodes.items() if "phandle" in p}
+
+    def strings(self, path, prop):
+        return [s.decode() for s in self.nodes.get(path, {}).get(prop, b"").split(b"\0") if s]
+
+    def enabled(self, path):
+        """Linux's of_device_is_available(): no status, "okay" or "ok"."""
+        return self.strings(path, "status") in ([], ["okay"], ["ok"])
+
+    def ane_nodes(self):
+        return [path for path in self.nodes
+                if self.enabled(path) and any(ANE.fullmatch(c) for c in self.strings(path, "compatible"))]
+
+
+def cells(data):
+    return list(struct.unpack(f">{len(data) // 4}I", data))
+
+
+def sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def run(*cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, check=True)
+    except FileNotFoundError:
+        raise Refuse(f"{cmd[0]} is missing; install dtc")
+    except subprocess.CalledProcessError as e:
+        raise Refuse(f"{cmd[0]} failed: {e.stderr.decode(errors='replace').strip()}")
+
+
+def fdt_string(overlay, prop):
+    out = subprocess.run(["fdtget", "-t", "s", str(overlay), "/", prop], capture_output=True)
+    return out.stdout.decode().split() if out.returncode == 0 else []
+
+
+def data_only(overlay):
+    out = subprocess.run(["fdtget", "-p", str(overlay), "/"], capture_output=True)
+    return "omarchy,data-only" in out.stdout.decode().split()
+
+
+def opted_in(root):
+    try:
+        return {line.strip() for line in (root / OPT_IN).read_text().splitlines()} - {""}
+    except FileNotFoundError:
+        return set()
+
+
+def overlays_for(root, name):
+    """The overlays that select device tree NAME, in the order they apply."""
+    found, allowed = [], opted_in(root)
+    for overlay in sorted(glob.glob(str(root / OVERLAY_DIR / "*/*.dtbo"))):
+        prefix = Path(overlay).parent.name
+        if name != f"{prefix}.dtb" and not name.startswith(f"{prefix}-") or data_only(overlay):
+            continue
+        if all(key in allowed for key in fdt_string(overlay, "omarchy,opt-in")):
+            found.append(Path(overlay))
+    return found
+
+
+def skip_compatibles(overlay):
+    return fdt_string(overlay, "omarchy,skip-if-compatible")
+
+
+def validate(stock, result, wanted):
+    """Refuse RESULT unless it is STOCK plus new or changed nodes whose
+    references resolve to enabled providers."""
+    if result.strings("/", "compatible") != stock.strings("/", "compatible"):
+        raise Refuse("the overlay changed the board compatible")
+    for path, props in stock.nodes.items():
+        if path not in result.nodes:
+            raise Refuse(f"the overlay removed {path}")
+        if "phandle" in props and result.nodes[path].get("phandle") != props["phandle"]:
+            raise Refuse(f"the overlay renumbered {path}; this fdtoverlay, or the libfdt.so it loads, is older "
+                         "than 1.7.1 (1.7.1 or newer keeps phandles)")
+    for compatible in wanted:
+        live = [p for p in result.nodes if compatible in result.strings(p, "compatible") and result.enabled(p)]
+        if not live:
+            raise Refuse(f"the result has no enabled {compatible} node")
+    for path in [p for p in result.nodes if result.nodes[p] != stock.nodes.get(p)]:
+        props = result.nodes[path]
+        plain = cells(props.get("interrupt-parent", b"")) + cells(props.get("memory-region", b""))
+        if "iommu-addresses" in props:
+            plain.append(cells(props["iommu-addresses"])[0])
+        for phandle in plain:
+            if phandle not in result.phandles:
+                raise Refuse(f"{path} names phandle {phandle:#x}, which no node has")
+            if not result.enabled(result.phandles[phandle]):
+                raise Refuse(f"{path} names {result.phandles[phandle]}, which is disabled")
+        for prop, count in REFS.items():
+            words, i = cells(props.get(prop, b"")), 0
+            while i < len(words):
+                target = result.phandles.get(words[i])
+                if target is None or count not in result.nodes[target]:
+                    raise Refuse(f"{path} {prop} names phandle {words[i]:#x}, which is not a {count} provider")
+                if not result.enabled(target):
+                    raise Refuse(f"{path} {prop} names {target}, which is disabled")
+                i += 1 + cells(result.nodes[target][count])[0]
+
+
+def build(stock_file, overlays, workdir):
+    """(overlaid device tree bytes, validated; the overlays applied), or None
+    when the kernel's tree has enabled nodes for every overlay."""
+    stock_bytes = stock_file.read_bytes()
+    stock = Tree(stock_bytes)
+    present = {c for p in stock.nodes if stock.enabled(p) for c in stock.strings(p, "compatible")}
+    needed = [o for o in overlays if not present.intersection(skip_compatibles(o))]
+    if not needed:
+        return None
+    current = workdir / "base.dtb"
+    current.write_bytes(stock_bytes)
+    for overlay in needed:
+        run("fdtoverlay", "-i", str(current), "-o", str(workdir / "next.dtb"), str(overlay))
+        os.replace(workdir / "next.dtb", current)
+    run("dtc", "-q", "-I", "dtb", "-O", "dtb", "-o", os.devnull, str(current))
+    data = current.read_bytes()
+    validate(stock, Tree(data), [c for o in needed for c in skip_compatibles(o)])
+    return data, needed
+
+
+def board(root):
+    compat = root / "sys/firmware/devicetree/base/compatible"
+    try:
+        strings = [s for s in compat.read_bytes().decode().split("\0") if s]
+    except OSError:
+        raise Refuse("no device tree in /sys/firmware/devicetree: not an Apple Silicon Linux system")
+    boards = [s[6:] for s in strings if re.fullmatch(r"apple,j[0-9a-z]+", s)]
+    socs = [s[6:] for s in strings if re.fullmatch(r"apple,t[0-9]+", s)]
+    if not boards or not socs:
+        raise Refuse(f"cannot tell this Mac's board from its compatible {strings}")
+    return f"{socs[0]}-{boards[0]}.dtb"
+
+
+def omarchy_mac(root):
+    """None without omarchy-mac-boot, else whether it applies overlays itself."""
+    if not glob.glob(str(root / "var/lib/pacman/local/omarchy-mac-boot-*/")):
+        return None
+    return (root / "usr/lib/omarchy-mac/boot/dtb-overlays.sh").is_file()
+
+
+def config_lines(root):
+    try:
+        return (root / CONFIG).read_text().splitlines()
+    except FileNotFoundError:
+        return []
+
+
+def dtbs_source(root):
+    """kernel when the last DTBS= line of CONFIG is not empty, overlay when it
+    is empty or absent, unknown without CONFIG (the collector's rule)."""
+    if not (root / CONFIG).is_file():
+        return "unknown"
+    values = [m.group(1).strip().strip("\"'") for m in map(DTBS.fullmatch, config_lines(root)) if m]
+    return "kernel" if values and values[-1] else "overlay"
+
+
+def set_line(root, present):
+    config = root / CONFIG
+    lines = config_lines(root)
+    kept = [line for line in lines if line != LINE]
+    if present:
+        kept.append(LINE)
+    if kept == lines:
+        return
+    config.parent.mkdir(parents=True, exist_ok=True)
+    tmp = config.with_name(".update-m1n1.omarchy-ane")
+    tmp.write_text("".join(f"{line}\n" for line in kept))
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, config)
+
+
+def write_copy(state, name, data, src):
+    state.mkdir(parents=True, exist_ok=True)
+    (state / f"{name}.src").unlink(missing_ok=True)
+    for path, content in ((state / name, data), (state / f"{name}.src", src.encode())):
+        tmp = path.with_name(f".{path.name}.new")
+        tmp.write_bytes(content)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+
+
+def remove_tree(path):
+    if path.is_dir():
+        for child in path.iterdir():
+            remove_tree(child)
+        path.rmdir()
+    else:
+        path.unlink(missing_ok=True)
+
+
+def apply(root, hook_targets):
+    if dtbs_source(root) == "kernel":
+        remove(root, quiet=True)
+        raise Refuse(f"DTBS= in /{CONFIG} names the device trees m1n1 boots, so {KERNEL_DT}")
+    mac = omarchy_mac(root)
+    if mac is not None:
+        remove(root, quiet=True)
+        if mac:
+            print(f"omarchy-ane-dt: omarchy-mac-boot applies /{OVERLAY_DIR} itself "
+                  "and rebuilds m1n1 when they change.")
+            return
+        raise Refuse("this omarchy-mac-boot refuses a changed device tree (omarchy update's boot check) and has "
+                     "no overlay support (omacom/omarchy-mac#677); the ANE node must come from the kernel or an "
+                     "omarchy-mac-boot with that support")
+    for old_dir in OLD_OVERLAY_DIRS:
+        old = glob.glob(str(root / old_dir / "*/*.dtbo"))
+        if old:
+            raise Refuse(f"overlays are in the old directory /{old_dir} ({len(old)} files). Install them in "
+                         f"/{OVERLAY_DIR} (the omarchy-ane package, or packaging/build-dtbo /), remove "
+                         f"/{old_dir}, then run apply again. The current copies stay until then")
+    name = board(root)
+    overlays = overlays_for(root, name)
+    state_root = root / "var/lib/omarchy-ane/dtbs"
+    kernels = sorted(Path(p).parent for p in glob.glob(str(root / "usr/lib/modules/*/dtbs")))
+    for stale in (state_root.iterdir() if state_root.is_dir() else []):
+        if stale.name not in {k.name for k in kernels}:
+            remove_tree(stale)
+    if not overlays:
+        removed = remove(root, quiet=True)
+        print(f"omarchy-ane-dt: no omarchy-ane overlay applies to {name}; nothing to apply")
+        if removed and not any("/dtbs/" in t for t in hook_targets or []):
+            print("m1n1 still has the old device tree. Run: sudo update-m1n1, then reboot.")
+        return
+    changed = False
+    with tempfile.TemporaryDirectory() as tmp:
+        for kernel in kernels:
+            stock_file = kernel / "dtbs" / name
+            state = state_root / kernel.name
+            if not stock_file.is_file():
+                print(f"omarchy-ane-dt: {kernel.name}: no {name}; skipped")
+                continue
+            src = (f"stock={sha256(stock_file.read_bytes())}\n"
+                   f"overlays={sha256(b''.join(o.read_bytes() for o in overlays))}\n")
+            try:
+                if (state / name).is_file() and (state / f"{name}.src").read_text() == src:
+                    print(f"omarchy-ane-dt: {kernel.name}: {name} copy is current")
+                    continue
+            except FileNotFoundError:
+                pass
+            built = build(stock_file, overlays, Path(tmp))
+            if built is None:
+                if state.exists():
+                    remove_tree(state)
+                print(f"omarchy-ane-dt: {kernel.name}: the kernel's {name} has the overlays' nodes enabled; "
+                      "no copy needed")
+                continue
+            data, applied = built
+            changed = changed or not (state / name).is_file() or (state / name).read_bytes() != data
+            write_copy(state, name, data, src)
+            print(f"omarchy-ane-dt: {kernel.name}: {name} + "
+                  f"{' '.join(f'{o.parent.name}/{o.name}' for o in applied)} -> {state / name}")
+    copies = glob.glob(str(state_root / "*/*.dtb"))
+    set_line(root, bool(copies))
+    if changed and not any("/dtbs/" in t for t in hook_targets or []):
+        print("m1n1 still has the old device tree. Run: sudo update-m1n1, then reboot.")
+
+
+def remove(root, quiet=False):
+    had = LINE in config_lines(root)
+    set_line(root, False)
+    state = root / "var/lib/omarchy-ane"
+    had = had or state.exists()
+    if state.exists():
+        remove_tree(state)
+    if had and not quiet:
+        print("omarchy-ane-dt: removed. m1n1 keeps the overlaid device tree until update-m1n1 runs: sudo update-m1n1")
+    return had
+
+
+def status(root, kver):
+    base = root / "sys/firmware/devicetree/base"
+    live = []
+    for compat in base.glob("**/compatible") if base.is_dir() else []:
+        st = compat.parent / "status"
+        if st.exists() and st.read_bytes().rstrip(b"\0") not in (b"okay", b"ok"):
+            continue
+        if any(ANE.fullmatch(s) for s in compat.read_bytes().decode(errors="replace").split("\0")):
+            live.append(str(compat.parent.relative_to(base)))
+    name = board(root)
+    stock = root / "usr/lib/modules" / kver / "dtbs" / name
+    kernel_has = stock.is_file() and bool(Tree(stock.read_bytes()).ane_nodes())
+    copy = root / "var/lib/omarchy-ane/dtbs" / kver / name
+    copy_has = copy.is_file() and bool(Tree(copy.read_bytes()).ane_nodes())
+    mac_overlay = omarchy_mac(root) and any(ANE.fullmatch(c) for o in overlays_for(root, name)
+                                            for c in skip_compatibles(o))
+    mode = dtbs_source(root)
+    if kernel_has:
+        source = "kernel"
+    elif (copy_has or mac_overlay) and mode != "kernel":
+        source = "overlay"
+    else:
+        source = "none"
+    if live and source == "none":
+        source = "other"
+    print(f"node={'present' if live else 'absent'} source={source} dtb={name} kernel={kver}"
+          + (f" path={','.join('/' + p for p in live)}" if live else ""))
+    print(f"{DTBS_SOURCE}={mode}" + (f": {KERNEL_DT}" if mode == "kernel" else ""))
+    soc = name.split("-")[0]
+    try:
+        if json.loads((root / SOC_DIR / f"{soc}.json").read_text()).get("state") == "data-only":
+            print(f"data-only (no driver): {soc}")
+    except (OSError, ValueError):
+        pass
+    return 0 if live else 1
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("action", choices=["apply", "remove", "status"])
+    ap.add_argument("--root", type=Path, default=Path("/"))
+    ap.add_argument("--hook", action="store_true", help="run from the pacman hook (targets on stdin)")
+    ap.add_argument("--kver", default=os.uname().release, help="kernel for status (default: running)")
+    args = ap.parse_args(argv)
+    targets = sys.stdin.read().split() if args.hook and not sys.stdin.isatty() else None
+    try:
+        if args.action == "apply":
+            apply(args.root, targets)
+        elif args.action == "remove":
+            remove(args.root)
+        else:
+            return status(args.root, args.kver)
+    except Refuse as e:
+        print(f"omarchy-ane-dt: {e}", file=sys.stderr)
+        return 0 if args.hook else 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

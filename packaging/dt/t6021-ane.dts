@@ -1,0 +1,17 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Overlay state: on by default.
+ * ANE for T6021 (M2 Max) board device trees. ane_t6021 then autoloads by the
+ * node's compatible; once it starts the ANE
+ * firmware, only a reboot unloads it. The nodes and their sources:
+ * t602x-ane.dtsi.
+ */
+/dts-v1/;
+/plugin/;
+
+/ {
+	/* dtb-overlays.sh: a kernel tree that has the node keeps its own. */
+	omarchy,skip-if-compatible = "apple,t6021-ane";
+};
+
+/include/ "t602x-ane.dtsi"

@@ -1,0 +1,39 @@
+name: Awesome-OS CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate-layout-and-build-files:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: Validate repository layout and required files
+        run: |
+          set -euo pipefail
+          for f in LICENSE README.md AWESOME-OS-INTEGRATION.md Makefile dkms.conf include/b8g_ane_abi.h; do
+            test -f "$f" || { echo "Missing required file: $f"; exit 1; }
+          done
+          for d in ane ane/t6021 include libane bindings packaging tools data/ane-soc; do
+            test -d "$d" || { echo "Missing required directory: $d"; exit 1; }
+          done
+          echo "Repository layout verified."
+      - name: Compile-check B8G ANE C11 ABI header
+        run: gcc -std=c11 -Wall -Wextra -fsyntax-only include/b8g_ane_abi.h
+      - name: Validate build files and metadata
+        run: |
+          set -euo pipefail
+          make -n all >/dev/null
+          grep -q 'PACKAGE_NAME="omarchy-ane"' dkms.conf
+          grep -q 'BUILT_MODULE_NAME\[0\]="ane"' dkms.conf
+          grep -q 'BUILT_MODULE_NAME\[1\]="ane_t6021"' dkms.conf
+          python3 tools/validate_ane_soc.py data/ane-soc/*.json
+          echo "Build files and SoC data validated."
