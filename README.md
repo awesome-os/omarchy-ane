@@ -125,3 +125,13 @@ python3 scripts/collect_quick.py --submit \
 No driver and no install needed. It finishes in seconds and fills in a row of the chip table above (see "Promotion"). Run it under macOS and Omarchy on the same machine, and submit both. The pair shows data neither side sees alone. The full story is in [omarchy-mlx docs/contribute-data.md](https://github.com/joshuaswarren/omarchy-mlx/blob/main/docs/contribute-data.md). It covers what gets collected and how redaction works. The deep collector adds benchmarks.
 
 Bringing up a chip takes more than a capture. Its overlay goes in `packaging/dt/`, with a cited source for every value. `tools/test_ane_overlays.py` must pass. Expect PMGR, DART and SET offset work, netconsole, and reboots. Do not write SET `0xf` from userspace.
+
+## Quick Install & Run (Windows / Linux / macOS)
+
+```sh
+# Install / hydrate from v11 CAS via holo-pm
+holo-pm install repository://github.com/awesome-os/omarchy-ane@main
+
+# Or project & run directly via holo-project (0-byte hardlink)
+holo-project "project://cpp/omarchy-ane?from=repository://github.com/awesome-os/omarchy-ane@main"
+```
